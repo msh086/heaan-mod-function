@@ -49,7 +49,6 @@ Ciphertext homo_eval_poly(Scheme &scheme, const Ciphertext &ciphertext, const st
         Ciphertext tmp_ciphertext = tower[cursor_bit_idx];
         scheme.multByConstAndEqual(tmp_ciphertext, coeffs[deg], log_factor);
         scheme.reScaleByAndEqual(tmp_ciphertext, log_factor);
-        // FIXME: use moddownto instead?
         while (++cursor_bit_idx < cur_deg_total_bits) {
             if ((1 << cursor_bit_idx) & deg) {
                 scheme.multAndEqual(tmp_ciphertext, tower[cursor_bit_idx]);
@@ -58,7 +57,7 @@ Ciphertext homo_eval_poly(Scheme &scheme, const Ciphertext &ciphertext, const st
                 scheme.multByConstAndEqual(tmp_ciphertext, 1, log_factor);
                 scheme.reScaleByAndEqual(tmp_ciphertext, log_factor);
             }
-        }
+        } // FIXME: use moddownto instead
         while (dst.logq > tmp_ciphertext.logq) {
             scheme.multByConstAndEqual(dst, 1, log_factor);
             scheme.reScaleByAndEqual(dst, log_factor);
@@ -70,7 +69,7 @@ Ciphertext homo_eval_poly(Scheme &scheme, const Ciphertext &ciphertext, const st
 
 void plain_eval_poly(complex<double> *dst, const complex<double> *src, int len, const std::vector<double> &coeffs) {
     for (int i = 0; i < len; i++) {
-        auto src_i = src[i]; // handle the case when dst == src
+        complex<double> src_i = src[i]; // handle the case when dst == src
         dst[i] = 0;
         for (int j = 0; j < coeffs.size(); j++) {
             dst[i] += coeffs[j] * pow(src_i, j);
@@ -100,7 +99,7 @@ Ciphertext homo_eval_mod(Scheme &scheme, Ciphertext &ciphertext, int n_iter, int
             scheme.reScaleByAndEqual(tmp, logp);
             scheme.addConstAndEqual(tmp, s ? -b : b, logp);
             // Step 2. composition of sign function
-            for (int j = 0; j < n_iter; j++) {
+            for (int j = 0; j <= n_iter; j++) { // NOTE: n_iter + 1 poly evals
                 // NOTE: no operator= for Ciphertext, so `tmp = homo_eval_poly(...)` will cause SIGSEGV
                 auto iterated = homo_eval_poly(scheme, tmp, coeffs);
                 tmp.copy(iterated);
@@ -113,9 +112,12 @@ Ciphertext homo_eval_mod(Scheme &scheme, Ciphertext &ciphertext, int n_iter, int
                 scheme.addAndEqual(res, tmp);
         }
     }
-    // Step 4. Multiply by q/2
-    scheme.multByConstAndEqual(res, modulus / 2, logp);
+    // Step 4. Substract and multiply by q/2
+    scheme.multByConstAndEqual(res, -modulus / 2, logp);
     scheme.reScaleByAndEqual(res, logp);
+	Ciphertext cpy = ciphertext;
+	scheme.modDownToAndEqual(cpy, res.logq);
+	scheme.addAndEqual(res, cpy);
     return res;
 }
 
@@ -130,21 +132,21 @@ void plain_eval_mod(complex<double>* dst, const complex<double>* src, int len, i
         // Step 1. adjust the inputs
         // formula: sgn{(2k+1)/(4k-2(i-1))[x/range+(2k-1-2(i-1))/(2k+1)]}
         //         =(2k+1)/[(4k-2(i-1))*range]x + (2k-1-2(i-1))/(4k-2(i-1)) denote as a*x +- b
-        double a = (2 * K + 1) / (range * (4 * K - 2 * (i - 1)));
+        double a = double(2 * K + 1) / (range * (4 * K - 2 * (i - 1)));
         double b = double(2 * K - 1 - 2 * (i - 1)) / (4 * K - 2 * (i - 1));
         for (int s = 0; s <= 1; s++) { // s == 0 mean ax+b, s == 1 means ax-b
             plain_eval_poly(scratch.data(), src, len, {s ? -b : b, a});
             // Step 2. composition of sign function
-            for (int j = 0; j < n_iter; j++)
+            for (int j = 0; j <= n_iter; j++) // NOTE: n_iter + 1 poly evals
                 plain_eval_poly(scratch.data(), scratch.data(), len, coeffs);
             // Step 3. place the sign functions together
             for(int j = 0; j < len; j++)
-                dst[i] += scratch[i];
+                dst[j] += scratch[j];
         }
     }
-    // Step 4. Multiply by q/2
+    // Step 4. Substract and multiply by q/2
     for(int i = 0; i < len; i++)
-        dst[i] *= modulus / 2;
+        dst[i] = src[i] - dst[i] * modulus * 0.5;
 }
 
 
@@ -171,14 +173,14 @@ void testBootstrap(long logq, long logp, long logSlots, long logT) {
 
     // FIXME: debugging
     int n_iter = 3, K = 1;
-    double modulus = 0.1, ratio = pow(2, -1), radius = modulus * ratio;
+    double modulus = 1, ratio = pow(2.0, -2), radius = modulus * ratio;
 
     std::vector<complex<double>> mod_input(slots);
     // sample uniformly from Union_i={-K, -K+1,..., K}(i*modulus + (-radius, radius))
     for(auto & e : mod_input){
         // sample double in (-radius, radius)
         auto rand_l = NTL::RandomBits_ulong(64);
-        double bias = long(rand_l) / std::pow(2, 63) * radius;
+        double bias = long(rand_l) / std::pow(2.0, 63) * radius;
         // sample nK in [-K, K]
         rand_l = (NTL::RandomBits_long(NumBits(2 * K + 1)) % (2 * K + 1));
         e.real((long(rand_l) - K) * modulus + bias);
@@ -186,10 +188,6 @@ void testBootstrap(long logq, long logp, long logSlots, long logT) {
     Ciphertext dbg;
     scheme.encrypt(dbg, mod_input.data(), slots, logp, 800); // NOTE: use larger value here, logq is too small
 
-//    scheme.conjugate(dbg, cipher0);
-//    scheme.addAndEqual(dbg, cipher0);
-//    scheme.multByConstAndEqual(dbg, 0.5, logp);
-//    scheme.reScaleByAndEqual(dbg, logp);
 
     // messages in slots have bound of 1, so 3 * 0.4 is enough
     auto dbg_res = homo_eval_mod(scheme, dbg, n_iter, K, modulus);
@@ -200,14 +198,16 @@ void testBootstrap(long logq, long logp, long logSlots, long logT) {
                                    1695.20531930029, 0, -1179.70428653061, 0, 640.410898402333, 0, -265.783179178834, 0,
                                    81.5068416148424, 0, -17.4159917980433, 0, 2.3164127022028, 0, -0.144464448094368};
     std::vector<complex<double>> plain_eval_vec(slots);
-    plain_eval_mod(plain_eval_vec.data(), mod_input.data(), slots, n_iter, K, modulus);
+	plain_eval_mod(plain_eval_vec.data(), mod_input.data(), slots, n_iter, K, modulus);
 
     for (int i = 0; i < slots; i++) {
         cout << "input[" << i << "]= " << mod_input[i] << '\n';
         cout << "homo_mod[" << i << "] = " << dbg_vec[i] << '\n';
         cout << "plain_mod[" << i << "] = " << plain_eval_vec[i] << '\n';
+		cout << "expected[" << i << "] = " << '\n';
+		cout << '\n';
     }
-    return;
+	
 
     // FIXME: end debugging
 
@@ -236,20 +236,22 @@ void testBootstrap(long logq, long logp, long logSlots, long logT) {
     timeutils.stop("CoeffToSlot");
 
     // FIXME: debug
+	int print_num = 20;
+	
     Plaintext before_mod;
     scheme.decryptMsg(before_mod, secretKey, cipher);
     before_mod.n = Nh; // number of total slots is N/2
     auto before_mod_slots = scheme.decode(before_mod);
-//    // confirm the effect of CoeffToSlot
-//    auto before_mod_q = ring.qpows[before_mod.logq];
-//    for(int i = 0; i < N; i++){
-//        auto expected = before_c2s.mx[i];
-//        rem(expected, expected, before_mod_q);
-//        if (NumBits(expected) == before_mod.logq) expected -= before_mod_q;
-//
-//        auto got = before_mod_slots[i];
-//        std::cout << "i th coeff: " << expected << " ==> " << got << '\n';
-//    }
+	// confirm the effect of CoeffToSlot
+	// auto before_mod_q = ring.qpows[before_mod.logq];
+	// for(int i = 0; i < print_num; i++){
+	   // auto expected = before_c2s.mx[i];
+	   // rem(expected, expected, before_mod_q);
+	   // if (NumBits(expected) == before_mod.logq) expected -= before_mod_q;
+
+	   // auto got = before_mod_slots[i];
+	   // std::cout << "i th coeff: " << expected << " ==> " << got << '\n';
+	// }
 
 
     timeutils.start("EvalExp");
@@ -261,8 +263,9 @@ void testBootstrap(long logq, long logp, long logSlots, long logT) {
     scheme.decryptMsg(after_mod, secretKey, cipher);
     after_mod.n = Nh;
     auto after_mod_slots = scheme.decode(after_mod);
-    for (int i = 0; i < Nh; i++) {
-        std::cout << "i th slot: " << before_mod_slots[i] << " ==> " << after_mod_slots[i] << '\n';
+    for (int i = 0; i < print_num; i++) {
+        std::cout << "i th slot: " << before_mod_slots[i] << " ==> " << after_mod_slots[i]
+			<< ", diff = " << after_mod_slots[i] - before_mod_slots[i] << '\n';
     }
 
     timeutils.start("SlotToCoeff");
