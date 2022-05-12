@@ -8,7 +8,6 @@ using namespace NTL;
 using namespace heaan;
 using std::cout, std::endl, std::complex;
 
-// TODO: mapping from deg to coeffs
 const static std::map<int, std::vector<double>> coeff_map{
         {
                 15, {0, 3.14208984375, 0, -7.33154296875, 0, 13.19677734375, 0, -15.71044921875,
@@ -82,11 +81,8 @@ Ciphertext homo_eval_poly(Scheme &scheme, const Ciphertext &ciphertext, const st
                 scheme.multByConstAndEqual(tmp_ciphertext, 1, log_factor);
                 scheme.reScaleByAndEqual(tmp_ciphertext, log_factor);
             }
-        } // FIXME: use moddownto instead
-        while (dst.logq > tmp_ciphertext.logq) {
-            scheme.multByConstAndEqual(dst, 1, log_factor);
-            scheme.reScaleByAndEqual(dst, log_factor);
         }
+        scheme.modDownToAndEqual(dst, tmp_ciphertext.logq);
         scheme.addAndEqual(dst, tmp_ciphertext);
     }
     return dst; // will RVO or NRVO optimize this out?
@@ -240,6 +236,7 @@ void testBootstrap(SecretKey &secretKey, Scheme &scheme,
                 }
             }
             fprintf(output, "\n");
+	    fflush(output);
         }
         if (filename.length())
             fclose(output);
@@ -336,12 +333,12 @@ int main() {
         scheme.addBootKey(secretKey, logn, logq + 4);
     }
 
-    int n_iter = 3, K = 16, deg = 31;
+    int n_iter = 2, K = 16, deg = 31;
     double modulus = 1;
 
-    int repeat = 1;
+    int repeat = 2;
     std::string filename = "output";
-    int n_threads = 1; // FIXME
+    int n_threads = 8;
 
     std::vector<std::thread> threads;
 
