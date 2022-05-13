@@ -107,33 +107,34 @@ Ciphertext homo_eval_mod(Scheme &scheme, Ciphertext &ciphertext, int n_iter, int
     bool init = false;
     double range = K * modulus + modulus * 0.5;
     auto logp = ciphertext.logp;
-    NTL_EXEC_RANGE(K, first, last)
-                    for (int i = first + 1; i <= last; i++) {
-                        // Step 1. adjust the inputs
-                        // formula: sgn{(2k+1)/(4k-2(i-1))[x/range+(2k-1-2(i-1))/(2k+1)]}
-                        //         =sgn{(2k+1)/[(4k-2(i-1))*range]x + (2k-1-2(i-1))/(4k-2(i-1))} denote as sgn{a*x +- b}
-                        double a = (2 * K + 1) / (range * (4 * K - 2 * (i - 1)));
-                        double b = double(2 * K - 1 - 2 * (i - 1)) / (4 * K - 2 * (i - 1));
-                        for (int s = 0; s <= 1; s++) { // s == 0 mean ax+b, s == 1 means ax-b
-                            Ciphertext tmp;
-                            scheme.multByConst(tmp, ciphertext, a, logp);
-                            scheme.reScaleByAndEqual(tmp, logp);
-                            scheme.addConstAndEqual(tmp, s ? -b : b, logp);
-                            // Step 2. composition of sign function
-                            for (int j = 0; j <= n_iter; j++) { // NOTE: n_iter + 1 poly evals
-                                // NOTE: no operator= for Ciphertext, so `tmp = homo_eval_poly(...)` will cause SIGSEGV
-                                auto iterated = homo_eval_poly(scheme, tmp, coeffs);
-                                tmp.copy(iterated);
-                            }
-                            // Step 3. place the sign functions together
-                            if (!init) {
-                                res.copy(tmp); // NOTE: use copy here too!
-                                init = true;
-                            } else
-                                scheme.addAndEqual(res, tmp);
-                        }
-                    }
-    NTL_EXEC_RANGE_END
+    //NTL_EXEC_RANGE(K, first, last)
+	for (int i = 1; i <= K; i++) {
+		// Step 1. adjust the inputs
+		// formula: sgn{(2k+1)/(4k-2(i-1))[x/range+(2k-1-2(i-1))/(2k+1)]}
+		//         =sgn{(2k+1)/[(4k-2(i-1))*range]x + (2k-1-2(i-1))/(4k-2(i-1))} denote as sgn{a*x +- b}
+		double a = (2 * K + 1) / (range * (4 * K - 2 * (i - 1)));
+		double b = double(2 * K - 1 - 2 * (i - 1)) / (4 * K - 2 * (i - 1));
+		for (int s = 0; s <= 1; s++) { // s == 0 mean ax+b, s == 1 means ax-b
+			Ciphertext tmp;
+			scheme.multByConst(tmp, ciphertext, a, logp);
+			scheme.reScaleByAndEqual(tmp, logp);
+			scheme.addConstAndEqual(tmp, s ? -b : b, logp);
+			// Step 2. composition of sign function
+			for (int j = 0; j <= n_iter; j++) { // NOTE: n_iter + 1 poly evals
+				// NOTE: no operator= for Ciphertext, so `tmp = homo_eval_poly(...)` will cause SIGSEGV
+				auto iterated = homo_eval_poly(scheme, tmp, coeffs);
+				tmp.copy(iterated);
+			}
+			// Step 3. place the sign functions together
+			// NOTE: if we want to use multithreading for K, we need to add mutex here
+			if (!init) {
+				res.copy(tmp); // NOTE: use copy here too!
+				init = true;
+			} else
+				scheme.addAndEqual(res, tmp);
+		}
+	}
+    //NTL_EXEC_RANGE_END
     // Step 4. Substract and multiply by q/2
     scheme.multByConstAndEqual(res, -modulus / 2, logp);
     scheme.reScaleByAndEqual(res, logp);
@@ -341,21 +342,53 @@ int main() {
     if (enable_boot) {
         scheme.addBootKey(secretKey, logn, logq + 4);
     }
+	
+	// FIXME: debug
+	/* int slots = 1 << logn;
+	int K = 16;
+	double radius = pow(2, -4);
+	Ciphertext ctxt;
+	std::vector<complex<double>> test_vec(slots);
+	for (int i = 0; i < slots; i++) {
+		// sample double in (-radius, radius)
+		auto rand_l = NTL::RandomBits_ulong(64);
+		double bias = long(rand_l) / std::pow(2.0, 63) * radius;
+		// sample nK in [-K, K]
+		double real_val = bias;
+		test_vec[i].real(real_val);
+	}
+	scheme.encrypt(ctxt, test_vec.data(), slots, logp, logq);
+	scheme.squareAndEqual(ctxt);
+	scheme.reScaleByAndEqual(ctxt, logp);
+	auto dec_vec = scheme.decrypt(secretKey, ctxt);
+	//FILE* f = fopen("error test", "w");
+	// for(int i = 0; i < slots; i++){
+		// fprintf(f, "%f -> (%f, %f), diff in real = %f\n", 
+			// test_vec[i].real(), dec_vec[i].real(), dec_vec[i].imag(), dec_vec[i].real() - test_vec[i].real() * test_vec[i].real());
+	// }
+	double mean = 0;
+	for(int i = 0; i < slots; i++)
+		mean += std::abs(dec_vec[i].real() - test_vec[i].real() * test_vec[i].real());
+	mean /= slots;
+	cout << "mean = " << mean << '\n';
+	//fclose(f); */
+	//return 0; // FIXME: finish debug
+	
 
     std::vector<std::thread> threads;
 
     TestParams testParams[] = {
             {
-                    2, 12, 31, 1, 1, pow(2.0, -7),  false, "2_12_31_-7"
+                    3, 12, 31, 1, pow(2.0, -4), pow(2.0, -7),  false, "2_12_31_-4_-7"
             },
             {
-                    2, 12, 31, 1, 1, pow(2.0, -10), false, "2_12_31_-10"
+                    3, 12, 31, 1, pow(2.0, -4), pow(2.0, -10), false, "2_12_31_-4_-10"
             },
             {
-                    2, 12, 31, 1, 1, pow(2.0, -5),  false, "2_12_31_-5"
+                    3, 12, 31, 1, pow(2.0, -4), pow(2.0, -5),  false, "2_12_31_-4_-5"
             },
             {
-                    2, 12, 31, 1, 1, pow(2.0, -3),  false, "2_12_31_-3"
+                    3, 12, 31, 1, pow(2.0, -4), pow(2.0, -3),  false, "2_12_31_-4_-3"
             }
     };
 
