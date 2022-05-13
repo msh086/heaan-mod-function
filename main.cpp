@@ -111,38 +111,38 @@ Ciphertext homo_eval_mod(Scheme &scheme, Ciphertext &ciphertext, int n_iter, int
     std::mutex mutex; // writer lock for init and res
     int dK = 2 * K;
     NTL_EXEC_RANGE(dK, first, last)
-        for (int ii = first + 1; ii <= last; ii++) {
-            int i = ii, s = 0;
-            if(i > K){
-                i -= K;
-                s = 1; // s == 0 mean ax+b, s == 1 means ax-b
-            }
-            // Step 1. adjust the inputs
-            // formula: sgn{(2k+1)/(4k-2(i-1))[x/range+(2k-1-2(i-1))/(2k+1)]}
-            //         =sgn{(2k+1)/[(4k-2(i-1))*range]x + (2k-1-2(i-1))/(4k-2(i-1))} denote as sgn{a*x +- b}
-            double a = (2 * K + 1) / (range * (4 * K - 2 * (i - 1)));
-            double b = double(2 * K - 1 - 2 * (i - 1)) / (4 * K - 2 * (i - 1));
+                    for (int ii = first + 1; ii <= last; ii++) {
+                        int i = ii, s = 0;
+                        if (i > K) {
+                            i -= K;
+                            s = 1; // s == 0 mean ax+b, s == 1 means ax-b
+                        }
+                        // Step 1. adjust the inputs
+                        // formula: sgn{(2k+1)/(4k-2(i-1))[x/range+(2k-1-2(i-1))/(2k+1)]}
+                        //         =sgn{(2k+1)/[(4k-2(i-1))*range]x + (2k-1-2(i-1))/(4k-2(i-1))} denote as sgn{a*x +- b}
+                        double a = (2 * K + 1) / (range * (4 * K - 2 * (i - 1)));
+                        double b = double(2 * K - 1 - 2 * (i - 1)) / (4 * K - 2 * (i - 1));
 
-            Ciphertext tmp;
-            scheme.multByConst(tmp, ciphertext, a, logp);
-            scheme.reScaleByAndEqual(tmp, logp);
-            scheme.addConstAndEqual(tmp, s ? -b : b, logp);
-            // Step 2. composition of sign function
-            for (int j = 0; j <= n_iter; j++) { // NOTE: n_iter + 1 poly evals
-                // NOTE: no operator= for Ciphertext, so `tmp = homo_eval_poly(...)` will cause SIGSEGV
-                auto iterated = homo_eval_poly(scheme, tmp, coeffs);
-                tmp.copy(iterated);
-            }
-            // Step 3. place the sign functions together
-            // NOTE: use mutex to ensure thread safety
-            mutex.lock();
-            if (!init) {
-                res.copy(tmp); // NOTE: use copy here too!
-                init = true;
-            } else
-                scheme.addAndEqual(res, tmp);
-            mutex.unlock();
-        }
+                        Ciphertext tmp;
+                        scheme.multByConst(tmp, ciphertext, a, logp);
+                        scheme.reScaleByAndEqual(tmp, logp);
+                        scheme.addConstAndEqual(tmp, s ? -b : b, logp);
+                        // Step 2. composition of sign function
+                        for (int j = 0; j <= n_iter; j++) { // NOTE: n_iter + 1 poly evals
+                            // NOTE: no operator= for Ciphertext, so `tmp = homo_eval_poly(...)` will cause SIGSEGV
+                            auto iterated = homo_eval_poly(scheme, tmp, coeffs);
+                            tmp.copy(iterated);
+                        }
+                        // Step 3. place the sign functions together
+                        // NOTE: use mutex to ensure thread safety
+                        mutex.lock();
+                        if (!init) {
+                            res.copy(tmp); // NOTE: use copy here too!
+                            init = true;
+                        } else
+                            scheme.addAndEqual(res, tmp);
+                        mutex.unlock();
+                    }
     NTL_EXEC_RANGE_END
     // Step 4. Substract and multiply by q/2
     scheme.multByConstAndEqual(res, -modulus / 2, logp);
@@ -210,13 +210,16 @@ void testBootstrap(SecretKey &secretKey, Scheme &scheme,
         std::vector<complex<double>> mod_input(slots);
         std::vector<complex<double>> expected(slots);
         double radius = modulus * eps;
+
         FILE *output = stdout;
         if (filename.length())
             output = fopen(filename.c_str(), "w");
+
         // header
         fprintf(output, "logq = %ld, logp = %ld, logSlots = %ld, logT = %ld, "
                         "K = %d, n_iter = %d, deg = %d, modulus = %f, eps = %f, repeat = %d, enable_boot = %d\n",
                 logq, logp, logSlots, logT, K, n_iter, deg, modulus, eps, repeat, enable_boot);
+
         for (int n_ctxt = 0; n_ctxt < repeat; n_ctxt++) {
             // sample uniformly from Union_i={-K, -K+1,..., K}(i*modulus + (-radius, radius))
             for (int i = 0; i < slots; i++) {
@@ -232,6 +235,7 @@ void testBootstrap(SecretKey &secretKey, Scheme &scheme,
                     expected_rem -= modulus;
                 expected[i].real(expected_rem);
             }
+
             fprintf(output, "%d th ciphertext\n", n_ctxt);
             Ciphertext dbg;
             scheme.encrypt(dbg, mod_input.data(), slots, logp, logq); // NOTE: use larger value here, logq is too small
@@ -240,6 +244,7 @@ void testBootstrap(SecretKey &secretKey, Scheme &scheme,
             auto dbg_vec = scheme.decrypt(secretKey, dbg_res);
             std::vector<complex<double>> plain_eval_vec(slots);
             plain_eval_mod(plain_eval_vec.data(), mod_input.data(), slots, n_iter, K, modulus, deg);
+
             for (int i = 0; i < slots; i++) {
                 // sample idx, input, expected, plain_eval, homo_eval.real, homo_eval.imag
                 fprintf(output, "%d, %f, %f, %f, %f, %f\n", i,
@@ -256,12 +261,14 @@ void testBootstrap(SecretKey &secretKey, Scheme &scheme,
     }
 
     /*** bootstrapping test part ***/
-    FILE* output = stdout;
-    if(filename.length())
+    FILE *output = stdout;
+    if (filename.length())
         output = fopen(filename.c_str(), "w");
+
     complex<double> *mvec = EvaluatorUtils::randomComplexArray(slots);
     Ciphertext cipher;
     scheme.encrypt(cipher, mvec, slots, logp, logq);
+
     cout << "cipher logq before: " << cipher.logq << endl;
     scheme.modDownToAndEqual(cipher, logq);
     scheme.normalizeAndEqual(cipher);
@@ -281,7 +288,6 @@ void testBootstrap(SecretKey &secretKey, Scheme &scheme,
     scheme.coeffToSlotAndEqual(cipher);
 
     // FIXME: debug
-    int print_num = Nh;
     Plaintext before_mod;
     scheme.decryptMsg(before_mod, secretKey, cipher);
     before_mod.n = Nh; // number of total slots is N/2
@@ -298,14 +304,14 @@ void testBootstrap(SecretKey &secretKey, Scheme &scheme,
     printf("before mod: logp = %ld, logq = %ld\n", cipher.logp, cipher.logq);
 
     // our mod function
-    Ciphertext mod_boot_in(cipher); // make a copy of cipher, to perform our mod function
     Ciphertext mod_boot_in_real, mod_boot_in_imag;
     scheme.conjugate(mod_boot_in_real, cipher); // a - bi
     scheme.sub(mod_boot_in_imag, cipher, mod_boot_in_real); // 2bi
-    scheme.idivAndEqual(mod_boot_in_imag); // 2b
     scheme.addAndEqual(mod_boot_in_real, cipher); // 2a
+    scheme.idivAndEqual(mod_boot_in_imag); // 2b
     scheme.divByPo2AndEqual(mod_boot_in_real, 1); // a
     scheme.divByPo2AndEqual(mod_boot_in_imag, 1); // b
+
     auto mod_boot_out_real = homo_eval_mod(scheme, mod_boot_in_real, n_iter, K, modulus, deg);
     auto mod_boot_out_imag = homo_eval_mod(scheme, mod_boot_in_imag, n_iter, K, modulus, deg);
 
@@ -317,16 +323,19 @@ void testBootstrap(SecretKey &secretKey, Scheme &scheme,
     scheme.decryptMsg(after_mod, secretKey, cipher);
     after_mod.n = Nh;
     auto after_mod_slots = scheme.decode(after_mod);
-    auto after_mod_slots_real = scheme.decrypt(secretKey, mod_boot_out_real);
-    auto after_mod_slots_imag = scheme.decrypt(secretKey, mod_boot_out_imag);
-    for (int i = 0; i < print_num; i++) {
+    Plaintext mod_boot_out_real_msg, mod_boot_out_imag_msg;
+    scheme.decryptMsg(mod_boot_out_real_msg, secretKey, mod_boot_out_real);
+    scheme.decryptMsg(mod_boot_out_imag_msg, secretKey, mod_boot_out_imag);
+    mod_boot_out_real_msg.n = mod_boot_out_imag_msg.n = Nh; // NOTE: important, different n has different embeddings
+    auto mod_boot_out_real_slots = scheme.decode(mod_boot_out_real_msg);
+    auto mod_boot_out_imag_slots = scheme.decode(mod_boot_out_imag_msg);
+    for (int i = 0; i < Nh; i++) {
         double before_real = before_mod_slots[i].real(), before_imag = before_mod_slots[i].imag(),
-            after_real = after_mod_slots[i].real(), after_imag = after_mod_slots[i].imag();
-        double after_real_new = after_mod_slots_real[i].real(), after_imag_new = after_mod_slots_imag[i].real();
+                after_real = after_mod_slots[i].real(), after_imag = after_mod_slots[i].imag();
+        double after_real_new = mod_boot_out_real_slots[i].real(), after_imag_new = mod_boot_out_imag_slots[i].real();
         fprintf(output, "%d, (%f, %f), (%f, %f), (%f, %f) ## (%f, %f), (%f, %f)\n", i,
                 before_real, before_imag, after_real, after_imag, after_real - before_real, after_imag - before_imag,
                 after_real_new, after_imag_new, after_real_new - before_real, after_imag_new - before_imag);
-
     }
 
     scheme.slotToCoeffAndEqual(cipher);
@@ -377,41 +386,41 @@ int main() {
     }
     testBootstrap(secretKey, scheme,
                   logq, logp, logn, logT,
-            8, 3, 31, pow(2.0, -4), 0,
-            0, true, "test_boot");
+                  8, 3, 31, pow(2.0, -4), 0,
+                  0, true, "test_boot");
     return 0;
-	
-	// FIXME: debug
-	/* int slots = 1 << logn;
-	int K = 16;
-	double radius = pow(2, -4);
-	Ciphertext ctxt;
-	std::vector<complex<double>> test_vec(slots);
-	for (int i = 0; i < slots; i++) {
-		// sample double in (-radius, radius)
-		auto rand_l = NTL::RandomBits_ulong(64);
-		double bias = long(rand_l) / std::pow(2.0, 63) * radius;
-		// sample nK in [-K, K]
-		double real_val = bias;
-		test_vec[i].real(real_val);
-	}
-	scheme.encrypt(ctxt, test_vec.data(), slots, logp, logq);
-	scheme.squareAndEqual(ctxt);
-	scheme.reScaleByAndEqual(ctxt, logp);
-	auto dec_vec = scheme.decrypt(secretKey, ctxt);
-	//FILE* f = fopen("error test", "w");
-	// for(int i = 0; i < slots; i++){
-		// fprintf(f, "%f -> (%f, %f), diff in real = %f\n", 
-			// test_vec[i].real(), dec_vec[i].real(), dec_vec[i].imag(), dec_vec[i].real() - test_vec[i].real() * test_vec[i].real());
-	// }
-	double mean = 0;
-	for(int i = 0; i < slots; i++)
-		mean += std::abs(dec_vec[i].real() - test_vec[i].real() * test_vec[i].real());
-	mean /= slots;
-	cout << "mean = " << mean << '\n';
-	//fclose(f); */
-	//return 0; // FIXME: finish debug
-	
+
+    // FIXME: debug
+    /* int slots = 1 << logn;
+    int K = 16;
+    double radius = pow(2, -4);
+    Ciphertext ctxt;
+    std::vector<complex<double>> test_vec(slots);
+    for (int i = 0; i < slots; i++) {
+        // sample double in (-radius, radius)
+        auto rand_l = NTL::RandomBits_ulong(64);
+        double bias = long(rand_l) / std::pow(2.0, 63) * radius;
+        // sample nK in [-K, K]
+        double real_val = bias;
+        test_vec[i].real(real_val);
+    }
+    scheme.encrypt(ctxt, test_vec.data(), slots, logp, logq);
+    scheme.squareAndEqual(ctxt);
+    scheme.reScaleByAndEqual(ctxt, logp);
+    auto dec_vec = scheme.decrypt(secretKey, ctxt);
+    //FILE* f = fopen("error test", "w");
+    // for(int i = 0; i < slots; i++){
+        // fprintf(f, "%f -> (%f, %f), diff in real = %f\n",
+            // test_vec[i].real(), dec_vec[i].real(), dec_vec[i].imag(), dec_vec[i].real() - test_vec[i].real() * test_vec[i].real());
+    // }
+    double mean = 0;
+    for(int i = 0; i < slots; i++)
+        mean += std::abs(dec_vec[i].real() - test_vec[i].real() * test_vec[i].real());
+    mean /= slots;
+    cout << "mean = " << mean << '\n';
+    //fclose(f); */
+    //return 0; // FIXME: finish debug
+
 
     std::vector<std::thread> threads;
 
