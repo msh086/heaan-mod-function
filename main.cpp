@@ -199,7 +199,7 @@ plain_eval_mod(complex<double> *dst, const complex<double> *src, int len, int n_
  * @param enable_boot test bootstrapping if true, else test mod function error
  * @param filename output filename
  */
-void testBootstrap(SecretKey &secretKey, Scheme &scheme,
+void testBootstrap(SecretKey &secretKey, Scheme &scheme, Ring& ring,
                    long logq, long logp, long logSlots, long logT,
                    int K, int n_iter, int deg, double modulus, double eps,
                    int repeat = 1, bool enable_boot = false, const std::string &filename = "") {
@@ -265,11 +265,24 @@ void testBootstrap(SecretKey &secretKey, Scheme &scheme,
     if (filename.length())
         output = fopen(filename.c_str(), "w");
 
-    complex<double> *mvec = EvaluatorUtils::randomComplexArray(slots);
-    Ciphertext cipher;
-    scheme.encrypt(cipher, mvec, slots, logp, logq);
+//    complex<double> *mvec = EvaluatorUtils::randomComplexArray(slots);
 
-    cout << "cipher logq before: " << cipher.logq << endl;
+    // sample from [-eps*q, eps*q]
+    Plaintext bounded_ptxt(logp, logq, slots);
+    // freshly encoded ptxt will have scaling factor of logp + logQ, where the logQ bits are removed during encryption
+    NTL::ZZ range = to_ZZ(to_RR(ZZ(1) << logq) * eps);
+    for(int i = 0; i < N; i += Nh/slots){ // follow the encoding rule in heaan
+        bounded_ptxt.mx[i] = (NTL::RandomBnd(range * 2) - range) << logQ;
+    }
+    Ciphertext cipher;
+    scheme.encryptMsg(cipher, bounded_ptxt);
+    Plaintext actual_ptxt(logp, logq, slots);
+    for(int i = 0; i < N; i += Nh/slots)
+        actual_ptxt.mx[i] = bounded_ptxt.mx[i] >> logQ;
+    auto mvec = scheme.decode(actual_ptxt);
+
+    printf("before boot: logp = %ld, logq = %ld\n", cipher.logp, cipher.logq);
+
     scheme.modDownToAndEqual(cipher, logq);
     scheme.normalizeAndEqual(cipher);
     cipher.logq = logQ;
@@ -280,6 +293,8 @@ void testBootstrap(SecretKey &secretKey, Scheme &scheme,
         scheme.addAndEqual(cipher, rot);
     }
     scheme.divByPo2AndEqual(cipher, logNh);
+
+    printf("before c2s: logp = %ld, logq = %ld\n", cipher.logp, cipher.logq);
 
     // FIXME: debug
     Plaintext before_c2s;
@@ -292,17 +307,11 @@ void testBootstrap(SecretKey &secretKey, Scheme &scheme,
     scheme.decryptMsg(before_mod, secretKey, cipher);
     before_mod.n = Nh; // number of total slots is N/2
     auto before_mod_slots = scheme.decode(before_mod);
-    // confirm the effect of CoeffToSlot
-/*     auto before_mod_q = ring.qpows[before_mod.logq];
-     for(int i = 0; i < print_num; i++){
-     auto expected = before_c2s.mx[i];
-     rem(expected, expected, before_mod_q);
-     if (NumBits(expected) == before_mod.logq) expected -= before_mod_q;
-     auto got = before_mod_slots[i];
-     std::cout << "i th coeff: " << expected << " ==> " << got << '\n';
-     }*/
+
     printf("before mod: logp = %ld, logq = %ld\n", cipher.logp, cipher.logq);
 
+#define DBG_MOD
+#ifdef DBG_MOD
     // our mod function
     Ciphertext mod_boot_in_real, mod_boot_in_imag;
     scheme.conjugate(mod_boot_in_real, cipher); // a - bi
@@ -314,7 +323,9 @@ void testBootstrap(SecretKey &secretKey, Scheme &scheme,
 
     auto mod_boot_out_real = homo_eval_mod(scheme, mod_boot_in_real, n_iter, K, modulus, deg);
     auto mod_boot_out_imag = homo_eval_mod(scheme, mod_boot_in_imag, n_iter, K, modulus, deg);
-
+    scheme.reScaleByAndEqual(mod_boot_out_real, 4);
+    scheme.reScaleByAndEqual(mod_boot_out_imag, 4);
+#endif
     scheme.evalExpAndEqual(cipher, logT);
 
     // FIXME: debug
@@ -323,26 +334,71 @@ void testBootstrap(SecretKey &secretKey, Scheme &scheme,
     scheme.decryptMsg(after_mod, secretKey, cipher);
     after_mod.n = Nh;
     auto after_mod_slots = scheme.decode(after_mod);
-    Plaintext mod_boot_out_real_msg, mod_boot_out_imag_msg;
-    scheme.decryptMsg(mod_boot_out_real_msg, secretKey, mod_boot_out_real);
-    scheme.decryptMsg(mod_boot_out_imag_msg, secretKey, mod_boot_out_imag);
-    mod_boot_out_real_msg.n = mod_boot_out_imag_msg.n = Nh; // NOTE: important, different n has different embeddings
-    auto mod_boot_out_real_slots = scheme.decode(mod_boot_out_real_msg);
-    auto mod_boot_out_imag_slots = scheme.decode(mod_boot_out_imag_msg);
-    for (int i = 0; i < Nh; i++) {
-        double before_real = before_mod_slots[i].real(), before_imag = before_mod_slots[i].imag(),
-                after_real = after_mod_slots[i].real(), after_imag = after_mod_slots[i].imag();
-        double after_real_new = mod_boot_out_real_slots[i].real(), after_imag_new = mod_boot_out_imag_slots[i].real();
-        fprintf(output, "%d, (%f, %f), (%f, %f), (%f, %f) ## (%f, %f), (%f, %f)\n", i,
-                before_real, before_imag, after_real, after_imag, after_real - before_real, after_imag - before_imag,
-                after_real_new, after_imag_new, after_real_new - before_real, after_imag_new - before_imag);
-    }
+
+    // print the values of ALL the slots to file(before and after mod)
+//    Plaintext mod_boot_out_real_msg, mod_boot_out_imag_msg;
+//    scheme.decryptMsg(mod_boot_out_real_msg, secretKey, mod_boot_out_real);
+//    scheme.decryptMsg(mod_boot_out_imag_msg, secretKey, mod_boot_out_imag);
+//    mod_boot_out_real_msg.n = mod_boot_out_imag_msg.n = Nh; // NOTE: important, different n has different embeddings
+//    auto mod_boot_out_real_slots = scheme.decode(mod_boot_out_real_msg);
+//    auto mod_boot_out_imag_slots = scheme.decode(mod_boot_out_imag_msg);
+//    for (int i = 0; i < Nh; i++) {
+//        double before_real = before_mod_slots[i].real(), before_imag = before_mod_slots[i].imag(),
+//                after_real = after_mod_slots[i].real(), after_imag = after_mod_slots[i].imag();
+//        double after_real_new = mod_boot_out_real_slots[i].real(), after_imag_new = mod_boot_out_imag_slots[i].real();
+//        fprintf(output, "%d, (%f, %f), (%f, %f), (%f, %f) ## (%f, %f), (%f, %f)\n", i,
+//                before_real, before_imag, after_real, after_imag, after_real - before_real, after_imag - before_imag,
+//                after_real_new, after_imag_new, after_real_new - before_real, after_imag_new - before_imag);
+//    }
 
     scheme.slotToCoeffAndEqual(cipher);
+
+    printf("after s2c: logp = %ld, logq = %ld\n", cipher.logp, cipher.logq);
+
+#ifdef DBG_MOD
+    scheme.imultAndEqual(mod_boot_out_imag); // (b mod q)i
+    scheme.addAndEqual(mod_boot_out_real, mod_boot_out_imag); // (a mod q) + (b mod q)i
+    scheme.slotToCoeffAndEqual(mod_boot_out_real);
+    mod_boot_out_real.logp = logp;
+#endif
+
     cipher.logp = logp;
-    cout << "cipher logq after: " << cipher.logq << endl;
-    complex<double> *dvec = scheme.decrypt(secretKey, cipher);
+    printf("after boot: logp = %ld, logq = %ld\n", cipher.logp, cipher.logq);
+
+    Plaintext dmsg, dmsg_new;
+    scheme.decryptMsg(dmsg, secretKey, cipher);
+#ifdef DBG_MOD
+    scheme.decryptMsg(dmsg_new, secretKey, mod_boot_out_real);
+#endif
+
+    auto q0 = ring.qpows[logq], q1 = ring.qpows[dmsg.logq], q2 = ring.qpows[dmsg_new.logq];
+    for(int i = 0; i < N; i++){
+        auto expected = actual_ptxt.mx[i];
+        NTL::rem(expected, expected, q0);
+        if(NTL::NumBits(expected) >= logq)
+            expected -= q0;
+        auto got = dmsg.mx[i];
+        NTL::rem(got, got, q1);
+        if(NTL::NumBits(got) >= dmsg.logq)
+            got -= q1;
+        fprintf(output, "%ld, %ld, %ld", to_long(expected), to_long(got), to_long(got - expected));
+#ifdef DBG_MOD
+        auto got_new = dmsg_new.mx[i];
+        NTL::rem(dmsg_new.mx[i], dmsg_new.mx[i], q2);
+        if(got_new >= q2)
+            got_new -= q2;
+        fprintf(output, ", %ld, %ld", to_long(got_new), to_long(got_new - expected));
+#endif
+        fprintf(output, "\n");
+    }
+
+
+    auto *dvec = scheme.decode(dmsg);
+    auto dvec_new = scheme.decode(dmsg_new);
     StringUtils::compare(mvec, dvec, slots, "boot");
+    StringUtils::compare(mvec, dvec_new, slots, "boot new");
+
+    fclose(output);
 }
 
 struct TestParams {
@@ -384,9 +440,9 @@ int main() {
     if (enable_boot) {
         scheme.addBootKey(secretKey, logn, logq + 4);
     }
-    testBootstrap(secretKey, scheme,
+    testBootstrap(secretKey, scheme, ring,
                   logq, logp, logn, logT,
-                  8, 3, 31, pow(2.0, -4), 0,
+                  8, 3, 31, pow(2.0, -4), pow(2.0, -10),
                   0, true, "test_boot");
     return 0;
 
@@ -441,7 +497,7 @@ int main() {
 
     for (auto &param: testParams) {
         threads.emplace_back(testBootstrap,
-                             std::ref(secretKey), std::ref(scheme),
+                             std::ref(secretKey), std::ref(scheme), std::ref(ring),
                              logq, logp, logn, logT,
                              param.K, param.n_iter, param.deg, param.modulus, param.eps,
                              param.repeat, param.enable_boot, param.fname);
