@@ -440,11 +440,11 @@ int main() {
     if (enable_boot) {
         scheme.addBootKey(secretKey, logn, logq + 4);
     }
-    testBootstrap(secretKey, scheme, ring,
-                  logq, logp, logn, logT,
-                  8, 3, 31, pow(2.0, -4), pow(2.0, -10),
-                  0, true, "test_boot");
-    return 0;
+//    testBootstrap(secretKey, scheme, ring,
+//                  logq, logp, logn, logT,
+//                  8, 3, 31, pow(2.0, -4), pow(2.0, -10),
+//                  0, true, "test_boot");
+//    return 0;
 
     // FIXME: debug
     /* int slots = 1 << logn;
@@ -482,16 +482,16 @@ int main() {
 
     TestParams testParams[] = {
             {
-                    3, 12, 31, 1, pow(2.0, -4), pow(2.0, -7),  false, "2_12_31_-4_-7"
+                    3, 8, 31, 1, pow(2.0, -4), pow(2.0, -7),  true, "2_12_31_-4_-7"
             },
             {
-                    3, 12, 31, 1, pow(2.0, -4), pow(2.0, -10), false, "2_12_31_-4_-10"
+                    3, 8, 31, 1, pow(2.0, -4), pow(2.0, -10), true, "2_12_31_-4_-10"
             },
             {
-                    3, 12, 31, 1, pow(2.0, -4), pow(2.0, -5),  false, "2_12_31_-4_-5"
+                    3, 8, 31, 1, pow(2.0, -4), pow(2.0, -5),  true, "2_12_31_-4_-5"
             },
             {
-                    3, 12, 31, 1, pow(2.0, -4), pow(2.0, -3),  false, "2_12_31_-4_-3"
+                    3, 8, 31, 1, pow(2.0, -4), pow(2.0, -3),  true, "2_12_31_-4_-3"
             }
     };
 
