@@ -336,20 +336,21 @@ void testBootstrap(SecretKey &secretKey, Scheme &scheme, Ring& ring,
     auto after_mod_slots = scheme.decode(after_mod);
 
     // print the values of ALL the slots to file(before and after mod)
-//    Plaintext mod_boot_out_real_msg, mod_boot_out_imag_msg;
-//    scheme.decryptMsg(mod_boot_out_real_msg, secretKey, mod_boot_out_real);
-//    scheme.decryptMsg(mod_boot_out_imag_msg, secretKey, mod_boot_out_imag);
-//    mod_boot_out_real_msg.n = mod_boot_out_imag_msg.n = Nh; // NOTE: important, different n has different embeddings
-//    auto mod_boot_out_real_slots = scheme.decode(mod_boot_out_real_msg);
-//    auto mod_boot_out_imag_slots = scheme.decode(mod_boot_out_imag_msg);
-//    for (int i = 0; i < Nh; i++) {
-//        double before_real = before_mod_slots[i].real(), before_imag = before_mod_slots[i].imag(),
-//                after_real = after_mod_slots[i].real(), after_imag = after_mod_slots[i].imag();
-//        double after_real_new = mod_boot_out_real_slots[i].real(), after_imag_new = mod_boot_out_imag_slots[i].real();
-//        fprintf(output, "%d, (%f, %f), (%f, %f), (%f, %f) ## (%f, %f), (%f, %f)\n", i,
-//                before_real, before_imag, after_real, after_imag, after_real - before_real, after_imag - before_imag,
-//                after_real_new, after_imag_new, after_real_new - before_real, after_imag_new - before_imag);
-//    }
+    Plaintext mod_boot_out_real_msg, mod_boot_out_imag_msg;
+    scheme.decryptMsg(mod_boot_out_real_msg, secretKey, mod_boot_out_real);
+    scheme.decryptMsg(mod_boot_out_imag_msg, secretKey, mod_boot_out_imag);
+    mod_boot_out_real_msg.n = mod_boot_out_imag_msg.n = Nh; // NOTE: important, different n has different embeddings
+    auto mod_boot_out_real_slots = scheme.decode(mod_boot_out_real_msg);
+    auto mod_boot_out_imag_slots = scheme.decode(mod_boot_out_imag_msg);
+    for (int i = 0; i < Nh; i++) {
+        double before_real = before_mod_slots[i].real(), before_imag = before_mod_slots[i].imag(),
+                after_real = after_mod_slots[i].real(), after_imag = after_mod_slots[i].imag();
+        double after_real_new = mod_boot_out_real_slots[i].real(), after_imag_new = mod_boot_out_imag_slots[i].real();
+        fprintf(stdout, "%d, (%f, %f), (%f, %f), (%f, %f) ## (%f, %f), (%f, %f), (%f, %f)\n", i,
+                before_real, before_imag, after_real, after_imag, after_real - before_real, after_imag - before_imag,
+                after_real_new, after_imag_new, after_real_new - before_real, after_imag_new - before_imag,
+                mod_boot_out_real_slots[i].imag(), mod_boot_out_imag_slots[i].imag());
+    }
 
     scheme.slotToCoeffAndEqual(cipher);
 
@@ -482,17 +483,17 @@ int main() {
 
     TestParams testParams[] = {
             {
-                    3, 8, 31, 1, pow(2.0, -4), pow(2.0, -7),  true, "2_12_31_-4_-7"
+                    3, 8, 31, 1, pow(2.0, -4), pow(2.0, -7),  true, "2_12_31_-4_-7_local"
             },
-            {
-                    3, 8, 31, 1, pow(2.0, -4), pow(2.0, -10), true, "2_12_31_-4_-10"
-            },
-            {
-                    3, 8, 31, 1, pow(2.0, -4), pow(2.0, -5),  true, "2_12_31_-4_-5"
-            },
-            {
-                    3, 8, 31, 1, pow(2.0, -4), pow(2.0, -3),  true, "2_12_31_-4_-3"
-            }
+//            {
+//                    3, 8, 31, 1, pow(2.0, -4), pow(2.0, -10), true, "2_12_31_-4_-10"
+//            },
+//            {
+//                    3, 8, 31, 1, pow(2.0, -4), pow(2.0, -5),  true, "2_12_31_-4_-5"
+//            },
+//            {
+//                    3, 8, 31, 1, pow(2.0, -4), pow(2.0, -3),  true, "2_12_31_-4_-3"
+//            }
     };
 
     for (auto &param: testParams) {
