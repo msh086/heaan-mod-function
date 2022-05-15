@@ -110,40 +110,43 @@ Ciphertext homo_eval_mod(Scheme &scheme, Ciphertext &ciphertext, int n_iter, int
     auto logp = ciphertext.logp;
     std::mutex mutex; // writer lock for init and res
     int dK = 2 * K;
-    NTL_EXEC_RANGE(dK, first, last)
-                    for (int ii = first + 1; ii <= last; ii++) {
-                        int i = ii, s = 0;
-                        if (i > K) {
-                            i -= K;
-                            s = 1; // s == 0 mean ax+b, s == 1 means ax-b
-                        }
-                        // Step 1. adjust the inputs
-                        // formula: sgn{(2k+1)/(4k-2(i-1))[x/range+(2k-1-2(i-1))/(2k+1)]}
-                        //         =sgn{(2k+1)/[(4k-2(i-1))*range]x + (2k-1-2(i-1))/(4k-2(i-1))} denote as sgn{a*x +- b}
-                        double a = (2 * K + 1) / (range * (4 * K - 2 * (i - 1)));
-                        double b = double(2 * K - 1 - 2 * (i - 1)) / (4 * K - 2 * (i - 1));
+    std::vector<std::thread> threads;
+    auto f = [&](int i){
+        int s = 0;
+        if (i > K) {
+            i -= K;
+            s = 1; // s == 0 mean ax+b, s == 1 means ax-b
+        }
+        // Step 1. adjust the inputs
+        // formula: sgn{(2k+1)/(4k-2(i-1))[x/range+(2k-1-2(i-1))/(2k+1)]}
+        //         =sgn{(2k+1)/[(4k-2(i-1))*range]x + (2k-1-2(i-1))/(4k-2(i-1))} denote as sgn{a*x +- b}
+        double a = (2 * K + 1) / (range * (4 * K - 2 * (i - 1)));
+        double b = double(2 * K - 1 - 2 * (i - 1)) / (4 * K - 2 * (i - 1));
 
-                        Ciphertext tmp;
-                        scheme.multByConst(tmp, ciphertext, a, logp);
-                        scheme.reScaleByAndEqual(tmp, logp);
-                        scheme.addConstAndEqual(tmp, s ? -b : b, logp);
-                        // Step 2. composition of sign function
-                        for (int j = 0; j <= n_iter; j++) { // NOTE: n_iter + 1 poly evals
-                            // NOTE: no operator= for Ciphertext, so `tmp = homo_eval_poly(...)` will cause SIGSEGV
-                            auto iterated = homo_eval_poly(scheme, tmp, coeffs);
-                            tmp.copy(iterated);
-                        }
-                        // Step 3. place the sign functions together
-                        // NOTE: use mutex to ensure thread safety
-                        mutex.lock();
-                        if (!init) {
-                            res.copy(tmp); // NOTE: use copy here too!
-                            init = true;
-                        } else
-                            scheme.addAndEqual(res, tmp);
-                        mutex.unlock();
-                    }
-    NTL_EXEC_RANGE_END
+        Ciphertext tmp;
+        scheme.multByConst(tmp, ciphertext, a, logp);
+        scheme.reScaleByAndEqual(tmp, logp);
+        scheme.addConstAndEqual(tmp, s ? -b : b, logp);
+        // Step 2. composition of sign function
+        for (int j = 0; j <= n_iter; j++) { // NOTE: n_iter + 1 poly evals
+            // NOTE: no operator= for Ciphertext, so `tmp = homo_eval_poly(...)` will cause SIGSEGV
+            auto iterated = homo_eval_poly(scheme, tmp, coeffs);
+            tmp.copy(iterated);
+        }
+        // Step 3. place the sign functions together
+        // NOTE: use mutex to ensure thread safety
+        mutex.lock();
+        if (!init) {
+            res.copy(tmp); // NOTE: use copy here too!
+            init = true;
+        } else
+            scheme.addAndEqual(res, tmp);
+        mutex.unlock();
+    };
+    for(int i = 1; i <= dK; i++)
+        threads.emplace_back(f, i);
+    for(auto &t : threads)
+        t.join();
     // Step 4. Substract and multiply by q/2
     scheme.multByConstAndEqual(res, -modulus / 2, logp);
     scheme.reScaleByAndEqual(res, logp);
@@ -199,7 +202,7 @@ plain_eval_mod(complex<double> *dst, const complex<double> *src, int len, int n_
  * @param enable_boot test bootstrapping if true, else test mod function error
  * @param filename output filename
  */
-void testBootstrap(SecretKey &secretKey, Scheme &scheme, Ring& ring,
+void testBootstrap(SecretKey &secretKey, Scheme &scheme, Ring &ring,
                    long logq, long logp, long logSlots, long logT,
                    int K, int n_iter, int deg, double modulus, double eps,
                    int repeat = 1, bool enable_boot = false, const std::string &filename = "") {
@@ -271,13 +274,13 @@ void testBootstrap(SecretKey &secretKey, Scheme &scheme, Ring& ring,
     Plaintext bounded_ptxt(logp, logq, slots);
     // freshly encoded ptxt will have scaling factor of logp + logQ, where the logQ bits are removed during encryption
     NTL::ZZ range = to_ZZ(to_RR(ZZ(1) << logq) * eps);
-    for(int i = 0; i < N; i += Nh/slots){ // follow the encoding rule in heaan
+    for (int i = 0; i < N; i += Nh / slots) { // follow the encoding rule in heaan
         bounded_ptxt.mx[i] = (NTL::RandomBnd(range * 2) - range) << logQ;
     }
     Ciphertext cipher;
     scheme.encryptMsg(cipher, bounded_ptxt);
     Plaintext actual_ptxt(logp, logq, slots);
-    for(int i = 0; i < N; i += Nh/slots)
+    for (int i = 0; i < N; i += Nh / slots)
         actual_ptxt.mx[i] = bounded_ptxt.mx[i] >> logQ;
     auto mvec = scheme.decode(actual_ptxt);
 
@@ -325,6 +328,8 @@ void testBootstrap(SecretKey &secretKey, Scheme &scheme, Ring& ring,
     auto mod_boot_out_imag = homo_eval_mod(scheme, mod_boot_in_imag, n_iter, K, modulus, deg);
     scheme.reScaleByAndEqual(mod_boot_out_real, 4);
     scheme.reScaleByAndEqual(mod_boot_out_imag, 4);
+    scheme.imultAndEqual(mod_boot_out_imag); // (b mod q)i
+    scheme.addAndEqual(mod_boot_out_real, mod_boot_out_imag); // (a mod q) + (b mod q)i
 #endif
     scheme.evalExpAndEqual(cipher, logT);
 
@@ -335,37 +340,34 @@ void testBootstrap(SecretKey &secretKey, Scheme &scheme, Ring& ring,
     after_mod.n = Nh;
     auto after_mod_slots = scheme.decode(after_mod);
 
+#ifdef DBG_MOD
     // print the values of ALL the slots to file(before and after mod)
-    Plaintext mod_boot_out_real_msg, mod_boot_out_imag_msg;
-    scheme.decryptMsg(mod_boot_out_real_msg, secretKey, mod_boot_out_real);
-    scheme.decryptMsg(mod_boot_out_imag_msg, secretKey, mod_boot_out_imag);
-    mod_boot_out_real_msg.n = mod_boot_out_imag_msg.n = Nh; // NOTE: important, different n has different embeddings
-    auto mod_boot_out_real_slots = scheme.decode(mod_boot_out_real_msg);
-    auto mod_boot_out_imag_slots = scheme.decode(mod_boot_out_imag_msg);
+    Plaintext mod_boot_out_msg_new;
+    scheme.decryptMsg(mod_boot_out_msg_new, secretKey, mod_boot_out_real);
+    mod_boot_out_msg_new.n = Nh; // NOTE: important, different n has different embeddings
+    auto mod_boot_out_slots_new = scheme.decode(mod_boot_out_msg_new);
     for (int i = 0; i < Nh; i++) {
         double before_real = before_mod_slots[i].real(), before_imag = before_mod_slots[i].imag(),
                 after_real = after_mod_slots[i].real(), after_imag = after_mod_slots[i].imag();
-        double after_real_new = mod_boot_out_real_slots[i].real(), after_imag_new = mod_boot_out_imag_slots[i].real();
-        fprintf(stdout, "%d, (%f, %f), (%f, %f), (%f, %f) ## (%f, %f), (%f, %f), (%f, %f)\n", i,
+        auto after_new = mod_boot_out_slots_new[i];
+        double after_real_new = after_new.real(), after_imag_new = after_new.imag();
+        fprintf(output, "%d, (%f, %f), (%f, %f), (%f, %f) ## (%f, %f), (%f, %f)\n", i,
                 before_real, before_imag, after_real, after_imag, after_real - before_real, after_imag - before_imag,
-                after_real_new, after_imag_new, after_real_new - before_real, after_imag_new - before_imag,
-                mod_boot_out_real_slots[i].imag(), mod_boot_out_imag_slots[i].imag());
+                after_real_new, after_imag_new, after_real_new - before_real, after_imag_new - before_imag);
     }
+#endif
 
     scheme.slotToCoeffAndEqual(cipher);
 
     printf("after s2c: logp = %ld, logq = %ld\n", cipher.logp, cipher.logq);
 
-#ifdef DBG_MOD
-    scheme.imultAndEqual(mod_boot_out_imag); // (b mod q)i
-    scheme.addAndEqual(mod_boot_out_real, mod_boot_out_imag); // (a mod q) + (b mod q)i
-    scheme.slotToCoeffAndEqual(mod_boot_out_real);
-    mod_boot_out_real.logp = logp;
-#endif
-
     cipher.logp = logp;
     printf("after boot: logp = %ld, logq = %ld\n", cipher.logp, cipher.logq);
 
+#ifdef DBG_MOD
+    scheme.slotToCoeffAndEqual(mod_boot_out_real);
+    mod_boot_out_real.logp = logp;
+#endif
     Plaintext dmsg, dmsg_new;
     scheme.decryptMsg(dmsg, secretKey, cipher);
 #ifdef DBG_MOD
@@ -373,14 +375,14 @@ void testBootstrap(SecretKey &secretKey, Scheme &scheme, Ring& ring,
 #endif
 
     auto q0 = ring.qpows[logq], q1 = ring.qpows[dmsg.logq], q2 = ring.qpows[dmsg_new.logq];
-    for(int i = 0; i < N; i++){
+    for (int i = 0; i < N; i++) {
         auto expected = actual_ptxt.mx[i];
         NTL::rem(expected, expected, q0);
-        if(NTL::NumBits(expected) >= logq)
+        if (NTL::NumBits(expected) >= logq)
             expected -= q0;
         auto got = dmsg.mx[i];
         NTL::rem(got, got, q1);
-        if(NTL::NumBits(got) >= dmsg.logq)
+        if (NTL::NumBits(got) >= dmsg.logq)
             got -= q1;
         fprintf(output, "%ld, %ld, %ld", to_long(expected), to_long(got), to_long(got - expected));
 #ifdef DBG_MOD
@@ -395,11 +397,14 @@ void testBootstrap(SecretKey &secretKey, Scheme &scheme, Ring& ring,
 
 
     auto *dvec = scheme.decode(dmsg);
-    auto dvec_new = scheme.decode(dmsg_new);
     StringUtils::compare(mvec, dvec, slots, "boot");
+#ifdef DBG_MOD
+    auto dvec_new = scheme.decode(dmsg_new);
     StringUtils::compare(mvec, dvec_new, slots, "boot new");
+#endif
 
-    fclose(output);
+    if (output != stdout)
+        fclose(output);
 }
 
 struct TestParams {
@@ -483,7 +488,7 @@ int main() {
 
     TestParams testParams[] = {
             {
-                    3, 8, 31, 1, pow(2.0, -4), pow(2.0, -7),  true, "2_12_31_-4_-7_local"
+                    3, 8, 31, 1, pow(2.0, -4), pow(2.0, -7), true, "2_12_31_-4_-7_local"
             },
 //            {
 //                    3, 8, 31, 1, pow(2.0, -4), pow(2.0, -10), true, "2_12_31_-4_-10"
