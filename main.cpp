@@ -183,6 +183,44 @@ plain_eval_mod(complex<double> *dst, const complex<double> *src, int len, int n_
 }
 
 
+void evalExpAndEqualNew(Scheme& scheme, Ring &ring, Ciphertext& cipher, long logT, long logI, int n_iter, int K, double modulus, int deg) {
+	long slots = cipher.n;
+	long logSlots = log2(slots);
+	BootContext* bootContext = ring.bootContextMap.at(logSlots);
+	if(logSlots < logNh) {
+		Ciphertext tmp;
+		scheme.conjugate(tmp, cipher);
+		scheme.subAndEqual(cipher, tmp);
+		scheme.idivAndEqual(cipher);
+		scheme.divByPo2AndEqual(cipher, 1);
+		// scheme.divByPo2AndEqual(cipher, logT + 1); // bitDown: logT + 1
+		auto ret_val = homo_eval_mod(scheme, cipher, n_iter, K, modulus, deg);
+		cipher.copy(ret_val);
+		RR c = 16 * 2 * 2 * Pi; // 2Pi because of the coeff of sign function, 2 because the extracted imag part wasn't divided by 2
+		scheme.multByConstAndEqual(cipher, c, cipher.logp);
+		scheme.imultAndEqual(cipher);
+		// exp2piAndEqual(cipher, bootContext->logp); // bitDown: logT + 1 + 3(logq + logI)
+		// for (long i = 0; i < logI + logT; ++i) {
+			// squareAndEqual(cipher);
+			// reScaleByAndEqual(cipher, bootContext->logp);
+		// }
+		// scheme.conjugate(tmp, cipher);
+		// scheme.subAndEqual(cipher, tmp);
+		
+		scheme.multByPolyNTT(tmp, cipher, bootContext->rp1, bootContext->bnd1, bootContext->logp);
+		Ciphertext tmprot;
+		scheme.leftRotateFast(tmprot, tmp, slots);
+		scheme.addAndEqual(tmp, tmprot);
+		scheme.multByPolyNTTAndEqual(cipher, bootContext->rp2, bootContext->bnd2, bootContext->logp);
+		scheme.leftRotateFast(tmprot, cipher, slots);
+		scheme.addAndEqual(cipher, tmprot);
+		scheme.addAndEqual(cipher, tmp);
+	} else{} // TODO
+	printf("before end rescaling, logp = %ld\n", cipher.logp);
+	scheme.reScaleByAndEqual(cipher, bootContext->logp + logI);
+	printf("after end rescaling, logp = %ld\n", cipher.logp);
+}
+
 // taylor approx in [-1/T, 1/T]
 /**
  *
@@ -274,15 +312,19 @@ void testBootstrap(SecretKey &secretKey, Scheme &scheme, Ring &ring,
     Plaintext bounded_ptxt(logp, logq, slots);
     // freshly encoded ptxt will have scaling factor of logp + logQ, where the logQ bits are removed during encryption
     NTL::ZZ range = to_ZZ(to_RR(ZZ(1) << logq) * eps);
-    for (int i = 0; i < N; i += Nh / slots) { // follow the encoding rule in heaan
-        bounded_ptxt.mx[i] = (NTL::RandomBnd(range * 2) - range) << logQ;
-    }
+    //for (int i = 0; i < N; i += Nh / slots) { // follow the encoding rule in heaan
+    //    bounded_ptxt.mx[i] = (NTL::RandomBnd(range * 2) - range) << logQ;
+    //}
+	bounded_ptxt.mx[0] = NTL::ZZ(1) << (logQ + logp);
+	bounded_ptxt.mx[Nh / slots] = NTL::ZZ(2) << (logQ + logp);
+	bounded_ptxt.mx[Nh / slots] = NTL::ZZ(3) << (logQ + logp);
     Ciphertext cipher;
     scheme.encryptMsg(cipher, bounded_ptxt);
     Plaintext actual_ptxt(logp, logq, slots);
     for (int i = 0; i < N; i += Nh / slots)
         actual_ptxt.mx[i] = bounded_ptxt.mx[i] >> logQ;
     auto mvec = scheme.decode(actual_ptxt);
+
 
     printf("before boot: logp = %ld, logq = %ld\n", cipher.logp, cipher.logq);
 
@@ -309,27 +351,15 @@ void testBootstrap(SecretKey &secretKey, Scheme &scheme, Ring &ring,
     Plaintext before_mod;
     scheme.decryptMsg(before_mod, secretKey, cipher);
     before_mod.n = Nh; // number of total slots is N/2
-    auto before_mod_slots = scheme.decode(before_mod);
+	auto before_mod_slots = scheme.decode(before_mod);
 
     printf("before mod: logp = %ld, logq = %ld\n", cipher.logp, cipher.logq);
 
 #define DBG_MOD
 #ifdef DBG_MOD
-    // our mod function
-    Ciphertext mod_boot_in_real, mod_boot_in_imag;
-    scheme.conjugate(mod_boot_in_real, cipher); // a - bi
-    scheme.sub(mod_boot_in_imag, cipher, mod_boot_in_real); // 2bi
-    scheme.addAndEqual(mod_boot_in_real, cipher); // 2a
-    scheme.idivAndEqual(mod_boot_in_imag); // 2b
-    scheme.divByPo2AndEqual(mod_boot_in_real, 1); // a
-    scheme.divByPo2AndEqual(mod_boot_in_imag, 1); // b
-
-    auto mod_boot_out_real = homo_eval_mod(scheme, mod_boot_in_real, n_iter, K, modulus, deg);
-    auto mod_boot_out_imag = homo_eval_mod(scheme, mod_boot_in_imag, n_iter, K, modulus, deg);
-    scheme.reScaleByAndEqual(mod_boot_out_real, 4);
-    scheme.reScaleByAndEqual(mod_boot_out_imag, 4);
-    scheme.imultAndEqual(mod_boot_out_imag); // (b mod q)i
-    scheme.addAndEqual(mod_boot_out_real, mod_boot_out_imag); // (a mod q) + (b mod q)i
+	Ciphertext mod_boot_out_real(cipher);
+	evalExpAndEqualNew(scheme, ring, mod_boot_out_real, logT, 4, n_iter, K, modulus, deg);
+    printf("after mod new: logp = %ld, logq = %ld\n", mod_boot_out_real.logp, mod_boot_out_real.logq);
 #endif
     scheme.evalExpAndEqual(cipher, logT);
 
@@ -358,16 +388,16 @@ void testBootstrap(SecretKey &secretKey, Scheme &scheme, Ring &ring,
 #endif
 
     scheme.slotToCoeffAndEqual(cipher);
-
     printf("after s2c: logp = %ld, logq = %ld\n", cipher.logp, cipher.logq);
-
+#ifdef DBG_MOD
+    scheme.slotToCoeffAndEqual(mod_boot_out_real);
+	printf("after s2c new: logp = %ld, logq = %ld\n", mod_boot_out_real.logp, mod_boot_out_real.logq);
+    mod_boot_out_real.logp = logp;
+#endif
     cipher.logp = logp;
     printf("after boot: logp = %ld, logq = %ld\n", cipher.logp, cipher.logq);
 
-#ifdef DBG_MOD
-    scheme.slotToCoeffAndEqual(mod_boot_out_real);
-    mod_boot_out_real.logp = logp;
-#endif
+
     Plaintext dmsg, dmsg_new;
     scheme.decryptMsg(dmsg, secretKey, cipher);
 #ifdef DBG_MOD
@@ -488,7 +518,7 @@ int main() {
 
     TestParams testParams[] = {
             {
-                    3, 8, 31, 1, pow(2.0, -4), pow(2.0, -7), true, "2_12_31_-4_-7_local"
+                    3, 8, 31, 1, pow(2.0, -4), pow(2.0, -7), true, "2_12_31_-4_-7_copy2"
             },
 //            {
 //                    3, 8, 31, 1, pow(2.0, -4), pow(2.0, -10), true, "2_12_31_-4_-10"
