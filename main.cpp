@@ -195,7 +195,7 @@ void evalExpAndEqualNew(Scheme &scheme, Ring &ring, Ciphertext &cipher, long log
         scheme.idivAndEqual(cipher);
         scheme.divByPo2AndEqual(cipher, 1);
         // scheme.divByPo2AndEqual(cipher, logT + 1); // bitDown: logT + 1
-        auto ret_val = homo_eval_mod(scheme, cipher, n_iter, K, modulus, deg);
+        auto ret_val = homo_eval_mod(scheme, cipher, n_iter, K, pow(2.0, -logT), deg);
         cipher.copy(ret_val);
         RR c = 16 * 2 * 2 *
                Pi; // 2Pi because of the coeff of sign function, 2 because the extracted imag part wasn't divided by 2
@@ -313,12 +313,9 @@ void testBootstrap(SecretKey &secretKey, Scheme &scheme, Ring &ring,
     Plaintext bounded_ptxt(logp, logq, slots);
     // freshly encoded ptxt will have scaling factor of logp + logQ, where the logQ bits are removed during encryption
     NTL::ZZ range = to_ZZ(to_RR(ZZ(1) << logq) * eps);
-    //for (int i = 0; i < N; i += Nh / slots) { // follow the encoding rule in heaan
-    //    bounded_ptxt.mx[i] = (NTL::RandomBnd(range * 2) - range) << logQ;
-    //}
-    bounded_ptxt.mx[0] = NTL::ZZ(1) << (logQ + logp);
-    bounded_ptxt.mx[Nh / slots] = NTL::ZZ(2) << (logQ + logp);
-    bounded_ptxt.mx[Nh / slots] = NTL::ZZ(3) << (logQ + logp);
+    for (int i = 0; i < N; i += Nh / slots) { // follow the encoding rule in heaan
+       bounded_ptxt.mx[i] = (NTL::RandomBnd(range * 2) - range) << logQ;
+    }
     Ciphertext cipher;
     scheme.encryptMsg(cipher, bounded_ptxt);
     Plaintext actual_ptxt(logp, logq, slots);
@@ -419,7 +416,7 @@ void testBootstrap(SecretKey &secretKey, Scheme &scheme, Ring &ring,
 #ifdef DBG_MOD
         auto got_new = dmsg_new.mx[i];
         NTL::rem(dmsg_new.mx[i], dmsg_new.mx[i], q2);
-        if (got_new >= q2)
+        if (NTL::NumBits(got_new) >= dmsg_new.logq)
             got_new -= q2;
         fprintf(output, ", %ld, %ld", to_long(got_new), to_long(got_new - expected));
 #endif
@@ -519,17 +516,17 @@ int main() {
 
     TestParams testParams[] = {
             {
-                    3, 8, 31, 1, pow(2.0, -4), pow(2.0, -7), true, "2_12_31_-4_-7_copy2"
+                    3, 8, 31, 1, pow(2.0, -4), pow(2.0, -7), true, "2_12_31_-4_-7"
             },
-//            {
-//                    3, 8, 31, 1, pow(2.0, -4), pow(2.0, -10), true, "2_12_31_-4_-10"
-//            },
-//            {
-//                    3, 8, 31, 1, pow(2.0, -4), pow(2.0, -5),  true, "2_12_31_-4_-5"
-//            },
-//            {
-//                    3, 8, 31, 1, pow(2.0, -4), pow(2.0, -3),  true, "2_12_31_-4_-3"
-//            }
+           {
+                   3, 8, 31, 1, pow(2.0, -4), pow(2.0, -10), true, "2_12_31_-4_-10"
+           },
+           {
+                   3, 8, 31, 1, pow(2.0, -4), pow(2.0, -5),  true, "2_12_31_-4_-5"
+           },
+           {
+                   3, 8, 31, 1, pow(2.0, -4), pow(2.0, -3),  true, "2_12_31_-4_-3"
+           }
     };
 
     for (auto &param: testParams) {
