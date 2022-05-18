@@ -9,28 +9,7 @@ using namespace NTL;
 using namespace heaan;
 using std::cout, std::endl, std::complex;
 
-const static std::map<int, std::vector<double>> coeff_map{
-        {
-                15, {0, 3.14208984375,     0, -7.33154296875,      0, 13.19677734375,    0, -15.71044921875,
-                                                                                                                 0, 12.21923828125,     0, -5.99853515625,      0, 1.69189453125,      0, -0.20947265625}
-        },
-        {
-                31, {0, 4.478397890925407, 0, -22.391989454627037, 0, 94.04635570943356, 0, -291.0958629101515,  0,
-                                                                                                                    679.2236801236868,  0, -1222.6026242226362, 0, 1724.1831880062819, 0, -1921.2326952069998, 0,
-                            1695.205319300294, 0, -1179.704286530614, 0, 640.4108984023333,  0, -265.78317917883396, 0,
-                            81.50684161484241, 0, -17.41599179804325,  0, 2.316412702202797,  0, -0.14446444809436798}
-        },
-        {
-                63, {0, 6.358192239869881, 0, -65.70131981198877,  0, 591.311878307899,  0, -4082.8677311735883, 0,
-                                                                                                                    22228.946536389536, 0, -98211.52742441195,  0, 360108.93388951046, 0, -1114622.8906103896, 0,
-                            2950472.35749809,  0, -6746401.706326042, 0, 13428551.967829932, 0, -23407080.70281818,  0,
-                            35890857.07765454, 0, -48570248.182011135, 0, 58140740.434624165, 0, -61641688.24574132, 0,
-                            57905828.35206003, 0, -48173756.36011717, 0, 35443154.078764886, 0, -23006959.66516317, 0,
-                            13130801.369873613, 0, -6558130.030800664, 0, 2848480.7204487734, 0, -1067192.1293078198, 0,
-                            341211.0889623641, 0, -91792.47334438503, 0, 20383.52455978361, 0, -3637.463978681924, 0,
-                            501.4048090914933, 0, -50.11117612778805, 0, 3.2312124497699397, 0, -0.10092368634714097}
-        }
-};
+static std::map<int, std::vector<RR>> coeff_map;
 
 /**
  *
@@ -39,7 +18,8 @@ const static std::map<int, std::vector<double>> coeff_map{
  * @param coeffs from the lowest term to the highest term
  * @return
  */
-Ciphertext homo_eval_poly(Scheme &scheme, const Ciphertext &ciphertext, const std::vector<double> &coeffs) {
+template<typename T>
+Ciphertext homo_eval_poly(Scheme &scheme, const Ciphertext &ciphertext, std::vector<T> &coeffs) {
     auto n_coeffs = coeffs.size();
     if (n_coeffs == 0)
         return ciphertext;
@@ -101,12 +81,23 @@ void plain_eval_poly(complex<double> *dst, const complex<double> *src, int len, 
 }
 
 
-Ciphertext homo_eval_mod(Scheme &scheme, Ciphertext &ciphertext, int n_iter, int K, double modulus, int deg) {
+void plain_eval_poly(complex<double> *dst, const complex<double> *src, int len, const std::vector<RR> &coeffs) {
+    for (int i = 0; i < len; i++) {
+        complex<double> src_i = src[i]; // handle the case when dst == src
+        dst[i] = 0;
+        for (int j = 0; j < coeffs.size(); j++) {
+            dst[i] += conv<double, RR>(coeffs[j]) * pow(src_i, j);
+        }
+    }
+}
+
+
+Ciphertext homo_eval_mod(Scheme &scheme, Ciphertext &ciphertext, int n_iter, int K, const RR& modulus, int deg) {
     auto &coeffs = coeff_map.at(deg);
 
     Ciphertext res = ciphertext;
     bool init = false;
-    double range = K * modulus + modulus * 0.5;
+    RR range = (K + 2) * modulus;
     auto logp = ciphertext.logp;
     std::mutex mutex; // writer lock for init and res
     int dK = 2 * K;
@@ -120,13 +111,14 @@ Ciphertext homo_eval_mod(Scheme &scheme, Ciphertext &ciphertext, int n_iter, int
         // Step 1. adjust the inputs
         // formula: sgn{(2k+1)/(4k-2(i-1))[x/range+(2k-1-2(i-1))/(2k+1)]}
         //         =sgn{(2k+1)/[(4k-2(i-1))*range]x + (2k-1-2(i-1))/(4k-2(i-1))} denote as sgn{a*x +- b}
-        double a = (2 * K + 1) / (range * (4 * K - 2 * (i - 1)));
-        double b = double(2 * K - 1 - 2 * (i - 1)) / (4 * K - 2 * (i - 1));
+        RR a = RR(2 * K + 1) / (range * (4 * K - 2 * (i - 1)));
+        RR b = RR(2 * K - 1 - 2 * (i - 1)) / RR(4 * K - 2 * (i - 1));
 
         Ciphertext tmp;
         scheme.multByConst(tmp, ciphertext, a, logp);
         scheme.reScaleByAndEqual(tmp, logp);
-        scheme.addConstAndEqual(tmp, s ? -b : b, logp);
+        RR signed_b = s ? -b : b;
+        scheme.addConstAndEqual(tmp, signed_b, logp);
         // Step 2. composition of sign function
         for (int j = 0; j <= n_iter; j++) { // NOTE: n_iter + 1 poly evals
             // NOTE: no operator= for Ciphertext, so `tmp = homo_eval_poly(...)` will cause SIGSEGV
@@ -183,8 +175,7 @@ plain_eval_mod(complex<double> *dst, const complex<double> *src, int len, int n_
 }
 
 
-void evalExpAndEqualNew(Scheme &scheme, Ring &ring, Ciphertext &cipher, long logT, long logI, int n_iter, int K,
-                        double modulus, int deg) {
+void evalExpAndEqualNew(Scheme &scheme, Ring &ring, Ciphertext &cipher, long logT, long logI, int n_iter, int K, int deg) {
     long slots = cipher.n;
     long logSlots = log2(slots);
     BootContext *bootContext = ring.bootContextMap.at(logSlots);
@@ -195,7 +186,7 @@ void evalExpAndEqualNew(Scheme &scheme, Ring &ring, Ciphertext &cipher, long log
         scheme.idivAndEqual(cipher);
         scheme.divByPo2AndEqual(cipher, 1);
         // scheme.divByPo2AndEqual(cipher, logT + 1); // bitDown: logT + 1
-        auto ret_val = homo_eval_mod(scheme, cipher, n_iter, K, pow(2.0, -logT), deg);
+        auto ret_val = homo_eval_mod(scheme, cipher, n_iter, K, RR(pow(2, -4)), deg);
         cipher.copy(ret_val);
         RR c = 16 * 2 * 2 *
                Pi; // 2Pi because of the coeff of sign function, 2 because the extracted imag part wasn't divided by 2
@@ -243,15 +234,15 @@ void evalExpAndEqualNew(Scheme &scheme, Ring &ring, Ciphertext &cipher, long log
  */
 void testBootstrap(SecretKey &secretKey, Scheme &scheme, Ring &ring,
                    long logq, long logp, long logSlots, long logT,
-                   int K, int n_iter, int deg, double modulus, double eps,
+                   int K, int n_iter, int deg, const RR& modulus, const RR& eps,
                    int repeat = 1, bool enable_boot = false, const std::string &filename = "") {
     long slots = (1 << logSlots);
     // test mod function
-    if (!enable_boot) {
+    if (!enable_boot) { // FIXME update to RR?? is it necessary?
         // preprocessing
         std::vector<complex<double>> mod_input(slots);
         std::vector<complex<double>> expected(slots);
-        double radius = modulus * eps;
+        double radius = to_double(modulus) * to_double(eps);
 
         FILE *output = stdout;
         if (filename.length())
@@ -260,7 +251,7 @@ void testBootstrap(SecretKey &secretKey, Scheme &scheme, Ring &ring,
         // header
         fprintf(output, "logq = %ld, logp = %ld, logSlots = %ld, logT = %ld, "
                         "K = %d, n_iter = %d, deg = %d, modulus = %f, eps = %f, repeat = %d, enable_boot = %d\n",
-                logq, logp, logSlots, logT, K, n_iter, deg, modulus, eps, repeat, enable_boot);
+                logq, logp, logSlots, logT, K, n_iter, deg, to_double(modulus), to_double(eps), repeat, enable_boot);
 
         for (int n_ctxt = 0; n_ctxt < repeat; n_ctxt++) {
             // sample uniformly from Union_i={-K, -K+1,..., K}(i*modulus + (-radius, radius))
@@ -270,11 +261,11 @@ void testBootstrap(SecretKey &secretKey, Scheme &scheme, Ring &ring,
                 double bias = long(rand_l) / std::pow(2.0, 63) * radius;
                 // sample nK in [-K, K]
                 rand_l = (NTL::RandomBits_long(NumBits(2 * K + 1)) % (2 * K + 1));
-                double real_val = (long(rand_l) - K) * modulus + bias;
+                double real_val = (long(rand_l) - K) * to_double(modulus) + bias;
                 mod_input[i].real(real_val);
-                double expected_rem = std::fmod(real_val, modulus);
+                double expected_rem = std::fmod(real_val, to_double(modulus));
                 if (expected_rem > modulus / 2)
-                    expected_rem -= modulus;
+                    expected_rem -= to_double(modulus);
                 expected[i].real(expected_rem);
             }
 
@@ -285,7 +276,7 @@ void testBootstrap(SecretKey &secretKey, Scheme &scheme, Ring &ring,
             auto dbg_res = homo_eval_mod(scheme, dbg, n_iter, K, modulus, deg);
             auto dbg_vec = scheme.decrypt(secretKey, dbg_res);
             std::vector<complex<double>> plain_eval_vec(slots);
-            plain_eval_mod(plain_eval_vec.data(), mod_input.data(), slots, n_iter, K, modulus, deg);
+            plain_eval_mod(plain_eval_vec.data(), mod_input.data(), slots, n_iter, K, to_double(modulus), deg);
 
             for (int i = 0; i < slots; i++) {
                 // sample idx, input, expected, plain_eval, homo_eval.real, homo_eval.imag
@@ -356,10 +347,10 @@ void testBootstrap(SecretKey &secretKey, Scheme &scheme, Ring &ring,
 #define DBG_MOD
 #ifdef DBG_MOD
     Ciphertext mod_boot_out_real(cipher);
-    evalExpAndEqualNew(scheme, ring, mod_boot_out_real, logT, 4, n_iter, K, modulus, deg);
+    evalExpAndEqualNew(scheme, ring, mod_boot_out_real, logT, 4, n_iter, K, deg);
     printf("after mod new: logp = %ld, logq = %ld\n", mod_boot_out_real.logp, mod_boot_out_real.logq);
 #endif
-    scheme.evalExpAndEqual(cipher, logT);
+    scheme.evalExpAndEqual(cipher, logT); // TODO update to RR too
 
     // FIXME: debug
     printf("after mod: logp = %ld, logq = %ld\n", cipher.logp, cipher.logq);
@@ -437,12 +428,59 @@ void testBootstrap(SecretKey &secretKey, Scheme &scheme, Ring &ring,
 
 struct TestParams {
     int n_iter, K, deg, repeat;
-    double modulus, eps;
+    RR modulus, eps;
     bool enable_boot;
     std::string fname;
 };
 
+using uchar = unsigned char;
+
 int main() {
+    RR::SetPrecision(100);
+    coeff_map = {
+            {15, {RR(0), to_RR(ZZFromBytes((uchar*)"\x23\x19", 2)) / to_RR(ZZFromBytes((uchar*)"\x00\x08", 2)), RR(0), -to_RR(ZZFromBytes((uchar*)"\xa7\x3a", 2)) / to_RR(ZZFromBytes((uchar*)"\x00\x08", 2)), RR(0), to_RR(ZZFromBytes((uchar*)"\x93\x69", 2)) / to_RR(ZZFromBytes((uchar*)"\x00\x08", 2)), RR(0), -to_RR(ZZFromBytes((uchar*)"\xaf\x7d", 2)) / to_RR(ZZFromBytes((uchar*)"\x00\x08", 2)), RR(0), to_RR(ZZFromBytes((uchar*)"\xc1\x61", 2)) / to_RR(ZZFromBytes((uchar*)"\x00\x08", 2)), RR(0), -to_RR(ZZFromBytes((uchar*)"\xfd\x2f", 2)) / to_RR(ZZFromBytes((uchar*)"\x00\x08", 2)), RR(0), to_RR(ZZFromBytes((uchar*)"\x89\x0d", 2)) / to_RR(ZZFromBytes((uchar*)"\x00\x08", 2)), RR(0), -to_RR(ZZFromBytes((uchar*)"\xad\x01", 2)) / to_RR(ZZFromBytes((uchar*)"\x00\x08", 2))}},
+            {31, {RR(0), to_RR(ZZFromBytes((uchar*)"\x23\xe1\xe9\x11", 4)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x04", 4)), RR(0), -to_RR(ZZFromBytes((uchar*)"\xaf\x65\x91\x59", 4)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x04", 4)), RR(0), to_RR(ZZFromBytes((uchar*)"\xdf\x77\x2f\x78\x01", 5)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x04", 4)), RR(0), -to_RR(ZZFromBytes((uchar*)"\xe3\x29\x62\x8c\x04", 5)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x04", 4)), RR(0), to_RR(ZZFromBytes((uchar*)"\x67\x0c\xe5\x9c\x0a", 5)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x04", 4)), RR(0), -to_RR(ZZFromBytes((uchar*)"\x53\x16\x69\x1a\x13", 5)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x04", 4)), RR(0), to_RR(ZZFromBytes((uchar*)"\xa3\x95\xbb\xf0\x1a", 5)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x04", 4)), RR(0), -to_RR(ZZFromBytes((uchar*)"\xa7\x47\xee\x04\x1e", 5)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x04", 4)), RR(0), to_RR(ZZFromBytes((uchar*)"\x39\x3f\xd2\x7c\x1a", 5)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x04", 4)), RR(0), -to_RR(ZZFromBytes((uchar*)"\x7d\x30\xd1\x6e\x12", 5)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x04", 4)), RR(0), to_RR(ZZFromBytes((uchar*)"\x8d\xc2\xa4\x01\x0a", 5)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x04", 4)), RR(0), -to_RR(ZZFromBytes((uchar*)"\xb9\xf9\x21\x27\x04", 5)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x04", 4)), RR(0), to_RR(ZZFromBytes((uchar*)"\x7d\x01\x07\x46\x01", 5)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x04", 4)), RR(0), -to_RR(ZZFromBytes((uchar*)"\xc1\xf9\xa9\x45", 4)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x04", 4)), RR(0), to_RR(ZZFromBytes((uchar*)"\xb1\x01\x44\x09", 4)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x04", 4)), RR(0), -to_RR(ZZFromBytes((uchar*)"\x7d\xee\x93", 3)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x04", 4))}},
+            {63, {RR(0), to_RR(ZZFromBytes((uchar*)"\x23\x21\xd8\x27\xf9\x64\xb7\x0c", 8)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), -to_RR(ZZFromBytes((uchar*)"\xbf\xab\x0e\xf1\x63\x13\x67\x83", 8)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), to_RR(ZZFromBytes((uchar*)"\xb7\x09\x84\x79\x83\xae\x9f\x9e\x04", 9)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), -to_RR(ZZFromBytes((uchar*)"\xcb\xb0\x8f\xa8\x42\x47\xbc\xe5\x1f", 9)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), to_RR(ZZFromBytes((uchar*)"\xc3\x50\x0e\xeb\x6a\xa0\xe4\xa9\xad", 9)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), -to_RR(ZZFromBytes((uchar*)"\x2f\xd9\xd8\x90\x92\x0a\x0e\x47\xff\x02", 10)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), to_RR(ZZFromBytes((uchar*)"\x57\x1c\x1b\x13\xc4\x26\xde\x59\xfd\x0a", 10)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), -to_RR(ZZFromBytes((uchar*)"\x7b\x88\x3b\xc1\x15\xfe\xc7\xfd\x03\x22", 10)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), to_RR(ZZFromBytes((uchar*)"\xaf\xd2\xd9\x59\xfd\x09\xb7\x90\x0a\x5a", 10)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), -to_RR(ZZFromBytes((uchar*)"\xdb\xa5\xc6\x25\x91\xa3\x69\x43\xe2\xcd", 10)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), to_RR(ZZFromBytes((uchar*)"\x13\x60\x16\x9e\x67\x87\xef\x8f\xce\x99\x01", 11)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), -to_RR(ZZFromBytes((uchar*)"\x17\x32\xe2\xd9\xc8\xd7\x67\xd1\x53\xca\x02", 11)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), to_RR(ZZFromBytes((uchar*)"\xdf\x5d\xe3\x1a\x56\xc2\x27\x52\x4d\x47\x04", 11)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), -to_RR(ZZFromBytes((uchar*)"\x5b\x50\x2f\x3d\x90\x30\x5d\x10\x3f\xca\x05", 11)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), to_RR(ZZFromBytes((uchar*)"\x03\x4c\x67\x06\x0f\x87\xde\x88\x50\xee\x06", 11)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), -to_RR(ZZFromBytes((uchar*)"\x17\xb8\x6f\x6a\xce\xd1\x7d\xb0\x27\x59\x07", 11)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), to_RR(ZZFromBytes((uchar*)"\xa9\x95\xf4\x44\x36\x41\xb4\x48\x25\xe7\x06", 11)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), -to_RR(ZZFromBytes((uchar*)"\x3d\x5c\xad\xf6\x46\x61\xb8\x78\x25\xbe\x05", 11)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), to_RR(ZZFromBytes((uchar*)"\x65\x4f\x8a\xe0\xde\x53\x28\xa4\xa3\x39\x04", 11)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), -to_RR(ZZFromBytes((uchar*)"\x61\x84\xe0\x52\x44\x90\x54\xdf\x1d\xbe\x02", 11)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), to_RR(ZZFromBytes((uchar*)"\xa9\xdd\x97\x03\x13\x60\xbd\x62\xb8\x90\x01", 11)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), -to_RR(ZZFromBytes((uchar*)"\x2d\x8e\x3a\xca\x1a\xc5\x0f\x64\x23\xc8", 10)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), to_RR(ZZFromBytes((uchar*)"\xe5\x23\x98\x5f\xa9\xde\x70\xc1\xed\x56", 10)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), -to_RR(ZZFromBytes((uchar*)"\x91\x8d\x33\x72\xa2\x34\x42\x70\x91\x20", 10)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), to_RR(ZZFromBytes((uchar*)"\x45\x92\x31\x99\x79\x8c\x2d\xb6\x69\x0a", 10)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), -to_RR(ZZFromBytes((uchar*)"\xe9\xb6\xd4\xfa\x31\x5a\xf2\x20\xcd\x02", 10)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), to_RR(ZZFromBytes((uchar*)"\x91\x3b\xd1\x96\x19\x93\x0c\x3f\x9f", 9)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), -to_RR(ZZFromBytes((uchar*)"\x7d\x24\xcf\x21\x9d\x8e\xed\x6a\x1c", 9)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), to_RR(ZZFromBytes((uchar*)"\xf5\x97\x2c\x22\x23\x43\xcf\xea\x03", 9)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), -to_RR(ZZFromBytes((uchar*)"\x89\x23\xe4\xd1\x13\xec\x38\x64", 8)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), to_RR(ZZFromBytes((uchar*)"\x01\x3f\x61\x6c\x7a\x61\x76\x06", 8)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), -to_RR(ZZFromBytes((uchar*)"\x1d\x66\x81\xf8\x44\xac\x33", 7)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8))}}
+    };
+    std::map<int, std::vector<double>> baseline_map =
+    {
+            {
+                    15, {0, 3.14208984375,     0, -7.33154296875,      0, 13.19677734375,    0, -15.71044921875,
+                                                                                                                     0, 12.21923828125,     0, -5.99853515625,      0, 1.69189453125,      0, -0.20947265625}
+            },
+            {
+                    31, {0, 4.478397890925407, 0, -22.391989454627037, 0, 94.04635570943356, 0, -291.0958629101515,  0,
+                                                                                                                        679.2236801236868,  0, -1222.6026242226362, 0, 1724.1831880062819, 0, -1921.2326952069998, 0,
+                                1695.205319300294, 0, -1179.704286530614, 0, 640.4108984023333,  0, -265.78317917883396, 0,
+                                81.50684161484241, 0, -17.41599179804325,  0, 2.316412702202797,  0, -0.14446444809436798}
+            },
+            {
+                    63, {0, 6.358192239869881, 0, -65.70131981198877,  0, 591.311878307899,  0, -4082.8677311735883, 0,
+                                                                                                                        22228.946536389536, 0, -98211.52742441195,  0, 360108.93388951046, 0, -1114622.8906103896, 0,
+                                2950472.35749809,  0, -6746401.706326042, 0, 13428551.967829932, 0, -23407080.70281818,  0,
+                                35890857.07765454, 0, -48570248.182011135, 0, 58140740.434624165, 0, -61641688.24574132, 0,
+                                57905828.35206003, 0, -48173756.36011717, 0, 35443154.078764886, 0, -23006959.66516317, 0,
+                                13130801.369873613, 0, -6558130.030800664, 0, 2848480.7204487734, 0, -1067192.1293078198, 0,
+                                341211.0889623641, 0, -91792.47334438503, 0, 20383.52455978361, 0, -3637.463978681924, 0,
+                                501.4048090914933, 0, -50.11117612778805, 0, 3.2312124497699397, 0, -0.10092368634714097}
+            }
+    };
+    for(auto &k : coeff_map){
+        auto &RR_vec = k.second;
+        auto &double_vec = baseline_map.at(k.first);
+        if(RR_vec.size() != double_vec.size()){
+            fprintf(stderr, "size mismatch\n");
+            return 1;
+        }
+        int len = RR_vec.size();
+        for(int i = 0; i < len; i++){
+            if(fabs(to_double(RR_vec[i]) - double_vec[i]) > 0.1){
+                fprintf(stderr, "coeffs mismatch: RR=%f double=%f\n", to_double(RR_vec[i]), double_vec[i]);
+                return 1;
+            }
+        }
+    }
+    printf("coeffs check pass\n");
     /*
   * Basic Parameters are in src/Params.h
   * If you want to use another parameter, you need to change src/Params.h file and re-complie this library.
@@ -516,17 +554,17 @@ int main() {
 
     TestParams testParams[] = {
             {
-                    3, 8, 31, 1, pow(2.0, -4), pow(2.0, -7), true, "2_12_31_-4_-7"
+                    3, 8, 31, 1, RR(pow(2.0, -4)), RR(pow(2.0, -7)), true, "2_12_31_-4_-7"
             },
-           {
-                   3, 8, 31, 1, pow(2.0, -4), pow(2.0, -10), true, "2_12_31_-4_-10"
-           },
-           {
-                   3, 8, 31, 1, pow(2.0, -4), pow(2.0, -5),  true, "2_12_31_-4_-5"
-           },
-           {
-                   3, 8, 31, 1, pow(2.0, -4), pow(2.0, -3),  true, "2_12_31_-4_-3"
-           }
+//           {
+//                   3, 8, 31, 1, RR(pow(2.0, -4)), RR(pow(2.0, -10)), true, "2_12_31_-4_-10"
+//           },
+//           {
+//                   3, 8, 31, 1, RR(pow(2.0, -4)), RR(pow(2.0, -5)),  true, "2_12_31_-4_-5"
+//           },
+//           {
+//                   3, 8, 31, 1, RR(pow(2.0, -4)), RR(pow(2.0, -3)),  true, "2_12_31_-4_-3"
+//           }
     };
 
     for (auto &param: testParams) {

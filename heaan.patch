@@ -1,0 +1,356 @@
+diff --git a/HEAAN/src/EvaluatorUtils.cpp b/HEAAN/src/EvaluatorUtils.cpp
+index 4422404..0a7bab7 100644
+--- a/HEAAN/src/EvaluatorUtils.cpp
++++ b/HEAAN/src/EvaluatorUtils.cpp
+@@ -91,13 +91,13 @@ ZZ EvaluatorUtils::scaleUpToZZ(const RR& x, const long logp) {
+ //----------------------------------------------------------------------------------
+ 
+ 
+-void EvaluatorUtils::leftRotateAndEqual(complex<double>* vals, const long n, const long r) {
++void EvaluatorUtils::leftRotateAndEqual(complex<RR>* vals, const long n, const long r) {
+ 	long rem = r % n;
+ 	if(rem != 0) {
+ 		long divisor = GCD(rem, n);
+ 		long steps = n / divisor;
+ 		for (long i = 0; i < divisor; ++i) {
+-			complex<double> tmp = vals[i];
++			complex<RR> tmp = vals[i];
+ 			long idx = i;
+ 			for (long j = 0; j < steps - 1; ++j) {
+ 				vals[idx] = vals[(idx + rem) % n];
+@@ -108,7 +108,24 @@ void EvaluatorUtils::leftRotateAndEqual(complex<double>* vals, const long n, con
+ 	}
+ }
+ 
+-void EvaluatorUtils::rightRotateAndEqual(complex<double>* vals, const long n, const long r) {
++void EvaluatorUtils::leftRotateAndEqual(complex<double>* vals, const long n, const long r) {
++    long rem = r % n;
++    if(rem != 0) {
++        long divisor = GCD(rem, n);
++        long steps = n / divisor;
++        for (long i = 0; i < divisor; ++i) {
++            complex<double> tmp = vals[i];
++            long idx = i;
++            for (long j = 0; j < steps - 1; ++j) {
++                vals[idx] = vals[(idx + rem) % n];
++                idx = (idx + rem) % n;
++            }
++            vals[idx] = tmp;
++        }
++    }
++}
++
++void EvaluatorUtils::rightRotateAndEqual(complex<RR>* vals, const long n, const long r) {
+ 	long rem = r % n;
+ 	rem = (n - rem) % n;
+ 	leftRotateAndEqual(vals, n, rem);
+diff --git a/HEAAN/src/EvaluatorUtils.h b/HEAAN/src/EvaluatorUtils.h
+index 9e2d518..c841f47 100644
+--- a/HEAAN/src/EvaluatorUtils.h
++++ b/HEAAN/src/EvaluatorUtils.h
+@@ -40,7 +40,9 @@ public:
+ 	//   DOUBLE & RR <-> ZZ
+ 	//----------------------------------------------------------------------------------
+ 
+-	static double scaleDownToReal(const NTL::ZZ& x, const long logp);
++//	static double scaleDownToReal(const NTL::ZZ& x, const long logp);
++
++    static double scaleDownToReal(const NTL::ZZ& x, const long logp);
+ 
+ 	static NTL::ZZ scaleUpToZZ(const double x, const long logp);
+ 
+@@ -51,10 +53,10 @@ public:
+ 	//   ROTATIONS
+ 	//----------------------------------------------------------------------------------
+ 
++    static void leftRotateAndEqual(std::complex<double>* vals, const long n, const long r);
++	static void leftRotateAndEqual(std::complex<NTL::RR>* vals, const long n, const long r);
+ 
+-	static void leftRotateAndEqual(std::complex<double>* vals, const long n, const long r);
+-
+-	static void rightRotateAndEqual(std::complex<double>* vals, const long n, const long r);
++	static void rightRotateAndEqual(std::complex<NTL::RR>* vals, const long n, const long r);
+ 
+ };
+ 
+diff --git a/HEAAN/src/Params.h b/HEAAN/src/Params.h
+index 3924cff..af75c0c 100644
+--- a/HEAAN/src/Params.h
++++ b/HEAAN/src/Params.h
+@@ -10,10 +10,13 @@
+ 
+ #include <NTL/ZZ.h>
+ 
++// alternative is NTL::RR
++#define BOOT_PREC_TYPE double
++
+ namespace heaan {
+ 
+ static const long logN = 16;
+-static const long logQ = 800; // 128-bit security
++static const long logQ = 1250; // 128-bit security
+ 
+ static const double sigma = 3.2;
+ static const long h = 64;
+diff --git a/HEAAN/src/Ring.cpp b/HEAAN/src/Ring.cpp
+index 515ba7e..6b2436d 100644
+--- a/HEAAN/src/Ring.cpp
++++ b/HEAAN/src/Ring.cpp
+@@ -23,6 +23,10 @@ using namespace NTL;
+ 
+ namespace heaan {
+ 
++std::complex<double> Ring::cmplxRR2double(const std::complex<NTL::RR> &val) {
++    return std::complex<double>(to_double(val.real()), to_double(val.imag()));
++}
++
+ Ring::Ring() {
+ 
+ 	qpows = new ZZ[logQQ + 1];
+@@ -39,9 +43,9 @@ Ring::Ring() {
+ 		fivePows %= M;
+ 	}
+ 
+-	ksiPows = new complex<double>[M + 1];
++	ksiPows = new complex<BOOT_PREC_TYPE>[M + 1];
+ 	for (long j = 0; j < M; ++j) {
+-		double angle = 2.0 * M_PI * j / M;
++		BOOT_PREC_TYPE angle = 2.0 * conv<BOOT_PREC_TYPE>(Pi) * j / M;
+ 		ksiPows[j].real(cos(angle));
+ 		ksiPows[j].imag(sin(angle));
+ 	}
+@@ -62,6 +66,19 @@ void Ring::arrayBitReverse(complex<double>* vals, long n) {
+ 	}
+ }
+ 
++void Ring::arrayBitReverse(complex<RR>* vals, long n) {
++    for (long i = 1, j = 0; i < n; ++i) {
++        long bit = n >> 1;
++        for (; j >= bit; bit >>= 1) {
++            j -= bit;
++        }
++        j += bit;
++        if (i < j) {
++            swap(vals[i], vals[j]);
++        }
++    }
++}
++
+ void Ring::EMB(complex<double>* vals, long n) {
+ 	arrayBitReverse(vals, n);
+ 	for (long len = 2; len <= n; len <<= 1) {
+@@ -73,7 +90,7 @@ void Ring::EMB(complex<double>* vals, long n) {
+ 				long idx = ((rotGroup[j] % lenq)) * gap;
+ 				complex<double> u = vals[i + j];
+ 				complex<double> v = vals[i + j + lenh];
+-				v *= ksiPows[idx];
++				v *= cmplxRR2double(ksiPows[idx]);
+ 				vals[i + j] = u + v;
+ 				vals[i + j + lenh] = u - v;
+ 			}
+@@ -91,7 +108,7 @@ void Ring::EMBInvLazy(complex<double>* vals, long n) {
+ 				long idx = (lenq - (rotGroup[j] % lenq)) * gap;
+ 				complex<double> u = vals[i + j] + vals[i + j + lenh];
+ 				complex<double> v = vals[i + j] - vals[i + j + lenh];
+-				v *= ksiPows[idx];
++				v *= cmplxRR2double(ksiPows[idx]);
+ 				vals[i + j] = u;
+ 				vals[i + j + lenh] = v;
+ 			}
+@@ -100,6 +117,25 @@ void Ring::EMBInvLazy(complex<double>* vals, long n) {
+ 	arrayBitReverse(vals, n);
+ }
+ 
++void Ring::EMBInvLazy(complex<RR>* vals, long n) {
++    for (long len = n; len >= 1; len >>= 1) {
++        for (long i = 0; i < n; i += len) {
++            long lenh = len >> 1;
++            long lenq = len << 2;
++            long gap = M / lenq;
++            for (long j = 0; j < lenh; ++j) {
++                long idx = (lenq - (rotGroup[j] % lenq)) * gap;
++                complex<RR> u = vals[i + j] + vals[i + j + lenh];
++                complex<RR> v = vals[i + j] - vals[i + j + lenh];
++                v *= ksiPows[idx];
++                vals[i + j] = u;
++                vals[i + j + lenh] = v;
++            }
++        }
++    }
++    arrayBitReverse(vals, n);
++}
++
+ void Ring::EMBInv(complex<double>* vals, long n) {
+ 	EMBInvLazy(vals, n);
+ 	for (long i = 0; i < n; ++i) {
+@@ -107,8 +143,15 @@ void Ring::EMBInv(complex<double>* vals, long n) {
+ 	}
+ }
+ 
++void Ring::EMBInv(complex<RR>* vals, long n) {
++    EMBInvLazy(vals, n);
++    for (long i = 0; i < n; ++i) {
++        vals[i] /= RR(n);
++    }
++}
++
+ void Ring::encode(ZZ* mx, double* vals, long slots, long logp) {
+-	complex<double>* uvals = new complex<double>[slots];
++	auto* uvals = new complex<double>[slots];
+ 	long i, jdx, idx;
+ 	for (i = 0; i < slots; ++i) {
+ 		uvals[i].real(vals[i]);
+@@ -126,7 +169,7 @@ void Ring::encode(ZZ* mx, double* vals, long slots, long logp) {
+ }
+ 
+ void Ring::encode(ZZ* mx, complex<double>* vals, long slots, long logp) {
+-	complex<double>* uvals = new complex<double> [slots];
++	auto* uvals = new complex<RR> [slots];
+ 	long i, jdx, idx;
+ 	copy(vals, vals + slots, uvals);
+ 	long gap = Nh / slots;
+@@ -155,6 +198,12 @@ void Ring::decode(ZZ* mx, complex<double>* vals, long slots, long logp, long log
+ }
+ 
+ void Ring::addBootContext(long logSlots, long logp) {
++    /*
++     * functions called:
++     *  EvaluatorUtils::rightRotateAndEqual
++     *  EMBInv -> EMBInvLazy -> arrayBitReverse
++     *  EvaluatorUtils::scaleUpToZZ
++     * */
+ 	if (bootContextMap.find(logSlots) == bootContextMap.end()) {
+ 		long slots = 1 << logSlots;
+ 		long dslots = slots << 1;
+@@ -177,9 +226,9 @@ void Ring::addBootContext(long logSlots, long logp) {
+ 		long bnd2;
+ 
+ 		ZZ* pvec = new ZZ[N];
+-		complex<double>* pvals = new complex<double> [dslots];
++		auto* pvals = new complex<RR> [dslots];
+ 
+-		double c = 0.25 / M_PI;
++		RR c = 0.25 / Pi;
+ 
+ 		if (logSlots < logNh) {
+ 			long dgap = gap >> 1;
+@@ -214,9 +263,9 @@ void Ring::addBootContext(long logSlots, long logp) {
+ 			}
+ 
+ 			for (i = 0; i < slots; ++i) {
+-				pvals[i] = 0.0;
+-				pvals[i + slots].real(0);
+-				pvals[i + slots].imag(-c);
++				pvals[i] = RR(0.0);
++				pvals[i + slots].real(RR(0));
++				pvals[i + slots].imag(RR(-c));
+ 			}
+ 			EMBInv(pvals, dslots);
+ 			for (i = 0, jdx = Nh, idx = 0; i < dslots; ++i, jdx += dgap, idx += dgap) {
+@@ -232,8 +281,8 @@ void Ring::addBootContext(long logSlots, long logp) {
+ 			}
+ 
+ 			for (i = 0; i < slots; ++i) {
+-				pvals[i] = c;
+-				pvals[i + slots] = 0;
++				pvals[i] = RR(c);
++				pvals[i + slots] = RR(0);
+ 			}
+ 
+ 			EMBInv(pvals, dslots);
+diff --git a/HEAAN/src/Ring.h b/HEAAN/src/Ring.h
+index b2aa285..d74eaff 100644
+--- a/HEAAN/src/Ring.h
++++ b/HEAAN/src/Ring.h
+@@ -25,12 +25,13 @@ public:
+ 
+ 	NTL::ZZ* qpows;
+ 	long* rotGroup;
+-	std::complex<double>* ksiPows;
++	std::complex<BOOT_PREC_TYPE>* ksiPows;
+ 	std::map<long, BootContext*> bootContextMap;
+ 	RingMultiplier multiplier;
+ 
+ 	Ring();
+ 
++    static std::complex<double> cmplxRR2double(const std::complex<NTL::RR>& val);
+ 
+ 	//----------------------------------------------------------------------------------
+ 	//   Encode & Decode
+@@ -38,12 +39,16 @@ public:
+ 
+ 
+ 	void arrayBitReverse(std::complex<double>* vals, long size);
++    void arrayBitReverse(std::complex<NTL::RR>* vals, long size);
+ 
+ 	void EMB(std::complex<double>* vals, long size);
+ 
+ 	void EMBInvLazy(std::complex<double>* vals, long size);
++    void EMBInvLazy(std::complex<NTL::RR>* vals, long size);
++
+ 
+ 	void EMBInv(std::complex<double>* vals, long size);
++    void EMBInv(std::complex<NTL::RR>* val, long size);
+ 
+ 	void encode(NTL::ZZ* mx, double* vals, long slots, long logp);
+ 
+diff --git a/HEAAN/src/Scheme.cpp b/HEAAN/src/Scheme.cpp
+index 0b1fa9a..f48affe 100644
+--- a/HEAAN/src/Scheme.cpp
++++ b/HEAAN/src/Scheme.cpp
+@@ -208,7 +208,7 @@ void Scheme::encode(Plaintext& plain, complex<double>* vals, long n, long logp,
+ }
+ 
+ complex<double>* Scheme::decode(Plaintext& plain) {
+-	complex<double>* res = new complex<double>[plain.n];
++	auto* res = new complex<double>[plain.n];
+ 	ring.decode(plain.mx, res, plain.n, plain.logp, plain.logq);
+ 	return res;
+ }
+@@ -707,6 +707,15 @@ void Scheme::multByConst(Ciphertext& res, Ciphertext& cipher, double cnst, long
+ 	res.logp += logp;
+ }
+ 
++void Scheme::multByConst(Ciphertext &res, Ciphertext &cipher, const NTL::RR &cnst, long logp) {
++    ZZ q = ring.qpows[cipher.logq];
++    ZZ cnstZZ = EvaluatorUtils::scaleUpToZZ(cnst, logp);
++    ring.multByConst(res.ax, cipher.ax, cnstZZ, q);
++    ring.multByConst(res.bx, cipher.bx, cnstZZ, q);
++    res.copyParams(cipher);
++    res.logp += logp;
++}
++
+ void Scheme::multByConst(Ciphertext& res, Ciphertext& cipher, complex<double> cnst, long logp) {
+ 	res.copy(cipher);
+ 	multByConstAndEqual(res, cnst, logp);
+@@ -733,7 +742,7 @@ void Scheme::multByConstAndEqual(Ciphertext& cipher, double cnst, long logp) {
+ 	cipher.logp += logp;
+ }
+ 
+-void Scheme::multByConstAndEqual(Ciphertext& cipher, RR& cnst, long logp) {
++void Scheme::multByConstAndEqual(Ciphertext& cipher, const RR& cnst, long logp) {
+ 	ZZ q = ring.qpows[cipher.logq];
+ 	ZZ cnstZZ = EvaluatorUtils::scaleUpToZZ(cnst, logp);
+ 	ring.multByConstAndEqual(cipher.ax, cnstZZ, q);
+diff --git a/HEAAN/src/Scheme.h b/HEAAN/src/Scheme.h
+index 0c41b52..87af080 100644
+--- a/HEAAN/src/Scheme.h
++++ b/HEAAN/src/Scheme.h
+@@ -162,6 +162,8 @@ public:
+ 
+ 	void multByConst(Ciphertext& res, Ciphertext& cipher, double cnst, long logp);
+ 
++    void multByConst(Ciphertext& res, Ciphertext& cipher, const NTL::RR& cnst, long logp);
++
+ 	void multByConst(Ciphertext& res, Ciphertext& cipher, std::complex<double> cnst, long logp);
+ 
+ 	void multByConstVec(Ciphertext& res, Ciphertext& cipher, std::complex<double>* cnstVec, long logp);
+@@ -170,7 +172,7 @@ public:
+ 
+ 	void multByConstAndEqual(Ciphertext& cipher, double cnst, long logp);
+ 
+-	void multByConstAndEqual(Ciphertext& cipher, NTL::RR& cnst, long logp);
++	void multByConstAndEqual(Ciphertext& cipher, const NTL::RR& cnst, long logp);
+ 
+ 	void multByConstAndEqual(Ciphertext& cipher, std::complex<double> cnst, long logp);
+ 
