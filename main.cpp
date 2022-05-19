@@ -12,17 +12,17 @@ using std::cout, std::endl, std::complex;
 static std::map<int, std::vector<RR>> coeff_map;
 
 /**
- *
+ * is inplace safe
  * @param scheme
  * @param ciphertext
  * @param coeffs from the lowest term to the highest term
  * @return
  */
 template<typename T>
-Ciphertext homo_eval_poly(Scheme &scheme, const Ciphertext &ciphertext, std::vector<T> &coeffs) {
+void homo_eval_poly(Scheme &scheme, Ciphertext &dst, const Ciphertext &ciphertext, std::vector<T> &coeffs) {
     auto n_coeffs = coeffs.size();
     if (n_coeffs == 0)
-        return ciphertext;
+        throw std::invalid_argument("the polynomial to be evaluated is empty");
     if (n_coeffs == 1)
         throw std::invalid_argument("the polynomial to be evaluated should not be constant");
     auto max_deg = coeffs.size() - 1;
@@ -38,7 +38,8 @@ Ciphertext homo_eval_poly(Scheme &scheme, const Ciphertext &ciphertext, std::vec
         tower.emplace_back(tmp);
     }
     // c^(2^0), ..., c^(2^(tower_size - 1)) are computed
-    Ciphertext dst = ciphertext;
+    if (&dst != &ciphertext)
+        dst.copy(ciphertext); // NOTE: assign operator is not overload, shallow copy will cause memory problem
     scheme.multByConstAndEqual(dst, coeffs[1], log_factor);
     scheme.reScaleByAndEqual(dst, log_factor);
     scheme.addConstAndEqual(dst, coeffs[0], log_factor);
@@ -66,7 +67,28 @@ Ciphertext homo_eval_poly(Scheme &scheme, const Ciphertext &ciphertext, std::vec
         scheme.modDownToAndEqual(dst, tmp_ciphertext.logq);
         scheme.addAndEqual(dst, tmp_ciphertext);
     }
-    return dst; // will RVO or NRVO optimize this out?
+}
+
+
+template<typename T>
+void homo_eval_poly(Scheme &scheme, Ciphertext &dst, std::vector<T> &coeffs) {
+    homo_eval_poly(scheme, dst, dst, coeffs);
+}
+
+
+/*
+ * is inplace safe
+ * evaluate a polynomial of degree `deg` for n_iter + 1 times
+ */
+void homo_eval_sign(Scheme &scheme, Ciphertext &dst, const Ciphertext &ciphertext, int n_iter, int deg) {
+    auto &coeffs = coeff_map.at(deg);
+    for (int i = 0; i <= n_iter; i++)
+        homo_eval_poly(scheme, dst, ciphertext, coeffs);
+}
+
+
+void homo_eval_sign(Scheme &scheme, Ciphertext &ciphertext, int n_iter, int deg) {
+    homo_eval_sign(scheme, ciphertext, ciphertext, n_iter, deg);
 }
 
 
@@ -92,10 +114,14 @@ void plain_eval_poly(complex<double> *dst, const complex<double> *src, int len, 
 }
 
 
-Ciphertext homo_eval_mod(Scheme &scheme, Ciphertext &ciphertext, int n_iter, int K, const RR& modulus, int deg) {
-    auto &coeffs = coeff_map.at(deg);
-
-    Ciphertext res = ciphertext;
+/*
+ * is inplace safe
+ */
+void homo_eval_mod(Scheme &scheme, Ciphertext &dst, const Ciphertext &ciphertext, int n_iter, int K, const RR &modulus,
+                   int deg) {
+    // `dst` cannot be the same object as `ciphertext`, because `ciphertext` is needed in every thread
+    bool same_obj = &dst == &ciphertext;
+    Ciphertext &res = same_obj ? *(new Ciphertext()) : dst;
     bool init = false;
     RR range = (K + 0.5) * modulus;
     auto logp = ciphertext.logp;
@@ -120,11 +146,7 @@ Ciphertext homo_eval_mod(Scheme &scheme, Ciphertext &ciphertext, int n_iter, int
         RR signed_b = s ? -b : b;
         scheme.addConstAndEqual(tmp, signed_b, logp);
         // Step 2. composition of sign function
-        for (int j = 0; j <= n_iter; j++) { // NOTE: n_iter + 1 poly evals
-            // NOTE: no operator= for Ciphertext, so `tmp = homo_eval_poly(...)` will cause SIGSEGV
-            auto iterated = homo_eval_poly(scheme, tmp, coeffs);
-            tmp.copy(iterated);
-        }
+        homo_eval_sign(scheme, tmp, n_iter, deg);
         // Step 3. place the sign functions together
         // NOTE: use mutex to ensure thread safety
         mutex.lock();
@@ -145,8 +167,64 @@ Ciphertext homo_eval_mod(Scheme &scheme, Ciphertext &ciphertext, int n_iter, int
     Ciphertext cpy = ciphertext;
     scheme.modDownToAndEqual(cpy, res.logq);
     scheme.addAndEqual(res, cpy);
-    return res;
+    if (same_obj) {
+        dst.copy(res);
+        delete &res;
+    }
 }
+
+
+void homo_eval_mod(Scheme &scheme, Ciphertext &ciphertext, int n_iter, int K, const RR &modulus, int deg) {
+    homo_eval_mod(scheme, ciphertext, ciphertext, n_iter, K, modulus, deg);
+}
+
+
+// is inplace safe
+void homo_eval_mod_precise(Scheme &scheme, Ciphertext &dst, const Ciphertext &ciphertext,
+                           int n_iter_mod_inner, int n_iter_mod_outer, int n_iter_sign, int K, const RR &modulus,
+                           int deg_mod_inner, int deg_mod_outer, int deg_sign) {
+    Ciphertext move_left, move_right, b;
+    auto logp = ciphertext.logp;
+    // compute b = (Sign(Mod(X) * 2/modulus) + 1) / 2, b = 1 iff Mod(x) > 0
+    homo_eval_mod(scheme, b, ciphertext, n_iter_mod_inner, K, modulus, deg_mod_inner);
+    scheme.multByConstAndEqual(b, RR(2) / modulus, logp);
+    scheme.reScaleByAndEqual(b, logp);
+    homo_eval_sign(scheme, b, n_iter_sign, deg_sign);
+    scheme.addConstAndEqual(b, 1, logp);
+    scheme.divByPo2AndEqual(b, 1);
+    // compute b * (Mod(X - modulus/4) + modulus/4) + (1 - b) * (Mod(X + modulus/4) - modulus/4)
+    // NOTE: I thought the two mod functions would share most of their components... but that will not happen for
+    //  a shift of modulus/4, but for a shift of modulus/2
+    // Mod(X - modulus/4) + modulus / 4
+    scheme.addConst(move_left, ciphertext, -modulus / 4, logp);
+    homo_eval_mod(scheme, move_left, n_iter_mod_outer, K, modulus, deg_mod_outer);
+    scheme.addConstAndEqual(move_left, modulus / 4, logp);
+    // Mod(X + modulus/4) - modulus/4
+    scheme.addConst(move_right, ciphertext, modulus / 4, logp);
+    homo_eval_mod(scheme, move_right, n_iter_mod_outer, K, modulus, deg_mod_outer);
+    scheme.addConstAndEqual(move_right, -modulus / 4, logp);
+    // place them together, but first put them under the same q
+    if (b.logq > move_left.logq)
+        scheme.modDownToAndEqual(b, move_left.logq);
+    else if (b.logq < move_left.logq) {
+        scheme.modDownToAndEqual(move_left, b.logq);
+        scheme.modDownToAndEqual(move_right, b.logq);
+    }
+    scheme.mult(dst, move_left, b);
+    scheme.negateAndEqual(b);
+    scheme.addConstAndEqual(b, 1, logp);
+    scheme.multAndEqual(move_right, b);
+    scheme.addAndEqual(dst, move_right);
+}
+
+
+void homo_eval_mod_precise(Scheme &scheme, Ciphertext &ciphertext,
+                           int n_iter_mod_inner, int n_iter_mod_outer, int n_iter_sign, int K, const RR &modulus,
+                           int deg_mod_inner, int deg_mod_outer, int deg_sign) {
+    homo_eval_mod_precise(scheme, ciphertext, ciphertext, n_iter_mod_inner, n_iter_mod_outer, n_iter_sign, K, modulus,
+                          deg_mod_inner, deg_mod_outer, deg_sign);
+}
+
 
 void
 plain_eval_mod(complex<double> *dst, const complex<double> *src, int len, int n_iter, int K, double modulus, int deg) {
@@ -175,7 +253,8 @@ plain_eval_mod(complex<double> *dst, const complex<double> *src, int len, int n_
 }
 
 
-void evalExpAndEqualNew(Scheme &scheme, Ring &ring, Ciphertext &cipher, long logT, long logI, int n_iter, int K, int deg) {
+void
+evalExpAndEqualNew(Scheme &scheme, Ring &ring, Ciphertext &cipher, long logT, long logI, int n_iter, int K, int deg) {
     long slots = cipher.n;
     long logSlots = log2(slots);
     BootContext *bootContext = ring.bootContextMap.at(logSlots);
@@ -186,8 +265,7 @@ void evalExpAndEqualNew(Scheme &scheme, Ring &ring, Ciphertext &cipher, long log
         scheme.idivAndEqual(cipher);
         scheme.divByPo2AndEqual(cipher, 1);
         // scheme.divByPo2AndEqual(cipher, logT + 1); // bitDown: logT + 1
-        auto ret_val = homo_eval_mod(scheme, cipher, n_iter, K, RR(pow(2, -4)), deg);
-        cipher.copy(ret_val);
+        homo_eval_mod(scheme, cipher, n_iter, K, RR(pow(2, -4)), deg);
         RR c = 16 * 2 * 2 *
                Pi; // 2Pi because of the coeff of sign function, 2 because the extracted imag part wasn't divided by 2
         scheme.multByConstAndEqual(cipher, c, bootContext->logp); // note that bootContext->logp == cipher.logp
@@ -213,6 +291,85 @@ void evalExpAndEqualNew(Scheme &scheme, Ring &ring, Ciphertext &cipher, long log
     scheme.reScaleByAndEqual(cipher, bootContext->logp + logI);
 }
 
+
+// sample uniformly from Union_i={-K, -K+1,..., K}(i*modulus + (-radius, radius))
+void sample_mod(std::vector<complex<double>> &mod_input, std::vector<complex<double>> &expected,
+                long nSlots, int K, const RR &modulus, const RR &eps) {
+    mod_input.resize(nSlots);
+    expected.resize(nSlots);
+    double radius = to_double(modulus) * to_double(eps);
+    for (int i = 0; i < nSlots; i++) {
+        // sample double in (-radius, radius)
+        auto rand_l = NTL::RandomBits_ulong(64);
+        double bias = long(rand_l) / std::pow(2.0, 63) * radius;
+        // sample nK in [-K, K]
+        rand_l = (NTL::RandomBits_long(NumBits(2 * K + 1)) % (2 * K + 1));
+        double real_val = (long(rand_l) - K) * to_double(modulus) + bias;
+        mod_input[i].real(real_val);
+        double expected_rem = std::fmod(real_val, to_double(modulus));
+        if (expected_rem > modulus / 2)
+            expected_rem -= to_double(modulus);
+        expected[i].real(expected_rem);
+    }
+}
+
+
+void test_precise_mod(Scheme &scheme, SecretKey &secretKey, long logp, long logq, long logSlots,
+                      int K, const RR &modulus, const RR &eps,
+                      int n_iter_mod_inner, int n_iter_mod_outer, int n_iter_sign,
+                      int deg_mod_inner, int deg_mod_outer, int deg_sign, bool precise = false,
+                      int repeat = 1, const std::string &filename = "") {
+    long slots = (1 << logSlots);
+    std::vector<complex<double>> mod_input(slots);
+    std::vector<complex<double>> expected(slots);
+
+    FILE *output = stdout;
+    if (filename.length())
+        output = fopen(filename.c_str(), "w");
+
+    int n_iter = n_iter_mod_outer, deg = deg_mod_outer; // for non-precise
+    // header
+    if (precise)
+        fprintf(output, "Non-precise: logq = %ld, logp = %ld, logSlots = %ld, "
+                        "K = %d, n_iter_sign = %d, n_iter_mod_inner = %d, n_iter_mod_outer = %d,"
+                        "deg_sign = %d, deg_sign_inner = %d, deg_sign_outer = %d, modulus = %f, eps = %f\n",
+                logq, logp, logSlots, K, n_iter_sign, n_iter_mod_inner, n_iter_mod_outer,
+                deg_sign, deg_mod_inner, deg_mod_outer, to_double(modulus), to_double(eps));
+    else
+        fprintf(output, "Non-precise: logq = %ld, logp = %ld, logSlots = %ld, "
+                        "K = %d, n_iter = %d, deg = %d, modulus = %f, eps = %f\n",
+                logq, logp, logSlots, K, n_iter, deg, to_double(modulus), to_double(eps));
+
+    for (int n_ctxt = 0; n_ctxt < repeat; n_ctxt++) {
+        sample_mod(mod_input, expected, slots, K, modulus, eps);
+        fprintf(output, "%d th ciphertext\n", n_ctxt);
+        Ciphertext dbg;
+        scheme.encrypt(dbg, mod_input.data(), slots, logp, logq); // NOTE: use larger value here, logq is too small
+        // messages in slots have bound of 1, so 3 * 0.4 is enough
+        if (precise) // FIXME: it seems there is some bug here
+            homo_eval_mod_precise(scheme, dbg, n_iter_mod_inner, n_iter_mod_outer, n_iter_sign, K, modulus,
+                                  deg_mod_inner, deg_mod_outer, deg_sign);
+        else
+            homo_eval_mod(scheme, dbg, n_iter, K, modulus, deg);
+        auto dbg_vec = scheme.decrypt(secretKey, dbg);
+        std::vector<complex<double>> plain_eval_vec(slots);
+        plain_eval_mod(plain_eval_vec.data(), mod_input.data(), slots, n_iter, K, to_double(modulus), deg);
+
+        for (int i = 0; i < slots; i++) {
+            // sample idx, input, expected, plain_eval, homo_eval.real, homo_eval.imag
+            fprintf(output, "%d, %f, %f, %f, %f, %f\n", i,
+                    mod_input[i].real(), expected[i].real(),
+                    plain_eval_vec[i].real(), dbg_vec[i].real(),
+                    dbg_vec[i].imag());
+        }
+        fprintf(output, "\n");
+        fflush(output);
+    }
+    if (output != stdout)
+        fclose(output);
+}
+
+
 // taylor approx in [-1/T, 1/T]
 /**
  *
@@ -234,78 +391,19 @@ void evalExpAndEqualNew(Scheme &scheme, Ring &ring, Ciphertext &cipher, long log
  */
 void testBootstrap(SecretKey &secretKey, Scheme &scheme, Ring &ring,
                    long logq, long logp, long logSlots, long logT,
-                   int K, int n_iter, int deg, const RR& modulus, const RR& eps,
-                   int repeat = 1, bool enable_boot = false, const std::string &filename = "") {
+                   int K, int n_iter, int deg, const RR &modulus, const RR &eps,
+                   int repeat = 1, const std::string &filename = "") {
     long slots = (1 << logSlots);
-    // test mod function
-    if (!enable_boot) { // FIXME update to RR?? is it necessary?
-        // preprocessing
-        std::vector<complex<double>> mod_input(slots);
-        std::vector<complex<double>> expected(slots);
-        double radius = to_double(modulus) * to_double(eps);
-
-        FILE *output = stdout;
-        if (filename.length())
-            output = fopen(filename.c_str(), "w");
-
-        // header
-        fprintf(output, "logq = %ld, logp = %ld, logSlots = %ld, logT = %ld, "
-                        "K = %d, n_iter = %d, deg = %d, modulus = %f, eps = %f, repeat = %d, enable_boot = %d\n",
-                logq, logp, logSlots, logT, K, n_iter, deg, to_double(modulus), to_double(eps), repeat, enable_boot);
-
-        for (int n_ctxt = 0; n_ctxt < repeat; n_ctxt++) {
-            // sample uniformly from Union_i={-K, -K+1,..., K}(i*modulus + (-radius, radius))
-            for (int i = 0; i < slots; i++) {
-                // sample double in (-radius, radius)
-                auto rand_l = NTL::RandomBits_ulong(64);
-                double bias = long(rand_l) / std::pow(2.0, 63) * radius;
-                // sample nK in [-K, K]
-                rand_l = (NTL::RandomBits_long(NumBits(2 * K + 1)) % (2 * K + 1));
-                double real_val = (long(rand_l) - K) * to_double(modulus) + bias;
-                mod_input[i].real(real_val);
-                double expected_rem = std::fmod(real_val, to_double(modulus));
-                if (expected_rem > modulus / 2)
-                    expected_rem -= to_double(modulus);
-                expected[i].real(expected_rem);
-            }
-
-            fprintf(output, "%d th ciphertext\n", n_ctxt);
-            Ciphertext dbg;
-            scheme.encrypt(dbg, mod_input.data(), slots, logp, logq); // NOTE: use larger value here, logq is too small
-            // messages in slots have bound of 1, so 3 * 0.4 is enough
-            auto dbg_res = homo_eval_mod(scheme, dbg, n_iter, K, modulus, deg);
-            auto dbg_vec = scheme.decrypt(secretKey, dbg_res);
-            std::vector<complex<double>> plain_eval_vec(slots);
-            plain_eval_mod(plain_eval_vec.data(), mod_input.data(), slots, n_iter, K, to_double(modulus), deg);
-
-            for (int i = 0; i < slots; i++) {
-                // sample idx, input, expected, plain_eval, homo_eval.real, homo_eval.imag
-                fprintf(output, "%d, %f, %f, %f, %f, %f\n", i,
-                        mod_input[i].real(), expected[i].real(),
-                        plain_eval_vec[i].real(), dbg_vec[i].real(),
-                        dbg_vec[i].imag());
-            }
-            fprintf(output, "\n");
-            fflush(output);
-        }
-        if (output != stdout)
-            fclose(output);
-        return;
-    }
-
-    /*** bootstrapping test part ***/
     FILE *output = stdout;
     if (filename.length())
         output = fopen(filename.c_str(), "w");
-
-//    complex<double> *mvec = EvaluatorUtils::randomComplexArray(slots);
 
     // sample from [-eps*q, eps*q]
     Plaintext bounded_ptxt(logp, logq, slots);
     // freshly encoded ptxt will have scaling factor of logp + logQ, where the logQ bits are removed during encryption
     NTL::ZZ range = to_ZZ(to_RR(ZZ(1) << logq) * eps);
     for (int i = 0; i < N; i += Nh / slots) { // follow the encoding rule in heaan
-       bounded_ptxt.mx[i] = (NTL::RandomBnd(range * 2) - range) << logQ;
+        bounded_ptxt.mx[i] = (NTL::RandomBnd(range * 2) - range) << logQ;
     }
     Ciphertext cipher;
     scheme.encryptMsg(cipher, bounded_ptxt);
@@ -426,10 +524,18 @@ void testBootstrap(SecretKey &secretKey, Scheme &scheme, Ring &ring,
         fclose(output);
 }
 
-struct TestParams {
+struct TestModParams {
+    int logp, logq, logSlots;
+    int n_iter_sign, n_iter_mod_inner, n_iter_mod_outer, deg_sign, deg_mod_inner, deg_mod_outer;
+    int K, repeat;
+    RR modulus, eps;
+    std::string fname;
+    bool precise;
+};
+
+struct TestBootParams {
     int n_iter, K, deg, repeat;
     RR modulus, eps;
-    bool enable_boot;
     std::string fname;
 };
 
@@ -438,43 +544,166 @@ using uchar = unsigned char;
 int main() {
     RR::SetPrecision(100);
     coeff_map = {
-            {15, {RR(0), to_RR(ZZFromBytes((uchar*)"\x23\x19", 2)) / to_RR(ZZFromBytes((uchar*)"\x00\x08", 2)), RR(0), -to_RR(ZZFromBytes((uchar*)"\xa7\x3a", 2)) / to_RR(ZZFromBytes((uchar*)"\x00\x08", 2)), RR(0), to_RR(ZZFromBytes((uchar*)"\x93\x69", 2)) / to_RR(ZZFromBytes((uchar*)"\x00\x08", 2)), RR(0), -to_RR(ZZFromBytes((uchar*)"\xaf\x7d", 2)) / to_RR(ZZFromBytes((uchar*)"\x00\x08", 2)), RR(0), to_RR(ZZFromBytes((uchar*)"\xc1\x61", 2)) / to_RR(ZZFromBytes((uchar*)"\x00\x08", 2)), RR(0), -to_RR(ZZFromBytes((uchar*)"\xfd\x2f", 2)) / to_RR(ZZFromBytes((uchar*)"\x00\x08", 2)), RR(0), to_RR(ZZFromBytes((uchar*)"\x89\x0d", 2)) / to_RR(ZZFromBytes((uchar*)"\x00\x08", 2)), RR(0), -to_RR(ZZFromBytes((uchar*)"\xad\x01", 2)) / to_RR(ZZFromBytes((uchar*)"\x00\x08", 2))}},
-            {31, {RR(0), to_RR(ZZFromBytes((uchar*)"\x23\xe1\xe9\x11", 4)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x04", 4)), RR(0), -to_RR(ZZFromBytes((uchar*)"\xaf\x65\x91\x59", 4)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x04", 4)), RR(0), to_RR(ZZFromBytes((uchar*)"\xdf\x77\x2f\x78\x01", 5)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x04", 4)), RR(0), -to_RR(ZZFromBytes((uchar*)"\xe3\x29\x62\x8c\x04", 5)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x04", 4)), RR(0), to_RR(ZZFromBytes((uchar*)"\x67\x0c\xe5\x9c\x0a", 5)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x04", 4)), RR(0), -to_RR(ZZFromBytes((uchar*)"\x53\x16\x69\x1a\x13", 5)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x04", 4)), RR(0), to_RR(ZZFromBytes((uchar*)"\xa3\x95\xbb\xf0\x1a", 5)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x04", 4)), RR(0), -to_RR(ZZFromBytes((uchar*)"\xa7\x47\xee\x04\x1e", 5)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x04", 4)), RR(0), to_RR(ZZFromBytes((uchar*)"\x39\x3f\xd2\x7c\x1a", 5)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x04", 4)), RR(0), -to_RR(ZZFromBytes((uchar*)"\x7d\x30\xd1\x6e\x12", 5)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x04", 4)), RR(0), to_RR(ZZFromBytes((uchar*)"\x8d\xc2\xa4\x01\x0a", 5)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x04", 4)), RR(0), -to_RR(ZZFromBytes((uchar*)"\xb9\xf9\x21\x27\x04", 5)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x04", 4)), RR(0), to_RR(ZZFromBytes((uchar*)"\x7d\x01\x07\x46\x01", 5)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x04", 4)), RR(0), -to_RR(ZZFromBytes((uchar*)"\xc1\xf9\xa9\x45", 4)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x04", 4)), RR(0), to_RR(ZZFromBytes((uchar*)"\xb1\x01\x44\x09", 4)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x04", 4)), RR(0), -to_RR(ZZFromBytes((uchar*)"\x7d\xee\x93", 3)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x04", 4))}},
-            {63, {RR(0), to_RR(ZZFromBytes((uchar*)"\x23\x21\xd8\x27\xf9\x64\xb7\x0c", 8)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), -to_RR(ZZFromBytes((uchar*)"\xbf\xab\x0e\xf1\x63\x13\x67\x83", 8)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), to_RR(ZZFromBytes((uchar*)"\xb7\x09\x84\x79\x83\xae\x9f\x9e\x04", 9)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), -to_RR(ZZFromBytes((uchar*)"\xcb\xb0\x8f\xa8\x42\x47\xbc\xe5\x1f", 9)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), to_RR(ZZFromBytes((uchar*)"\xc3\x50\x0e\xeb\x6a\xa0\xe4\xa9\xad", 9)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), -to_RR(ZZFromBytes((uchar*)"\x2f\xd9\xd8\x90\x92\x0a\x0e\x47\xff\x02", 10)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), to_RR(ZZFromBytes((uchar*)"\x57\x1c\x1b\x13\xc4\x26\xde\x59\xfd\x0a", 10)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), -to_RR(ZZFromBytes((uchar*)"\x7b\x88\x3b\xc1\x15\xfe\xc7\xfd\x03\x22", 10)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), to_RR(ZZFromBytes((uchar*)"\xaf\xd2\xd9\x59\xfd\x09\xb7\x90\x0a\x5a", 10)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), -to_RR(ZZFromBytes((uchar*)"\xdb\xa5\xc6\x25\x91\xa3\x69\x43\xe2\xcd", 10)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), to_RR(ZZFromBytes((uchar*)"\x13\x60\x16\x9e\x67\x87\xef\x8f\xce\x99\x01", 11)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), -to_RR(ZZFromBytes((uchar*)"\x17\x32\xe2\xd9\xc8\xd7\x67\xd1\x53\xca\x02", 11)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), to_RR(ZZFromBytes((uchar*)"\xdf\x5d\xe3\x1a\x56\xc2\x27\x52\x4d\x47\x04", 11)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), -to_RR(ZZFromBytes((uchar*)"\x5b\x50\x2f\x3d\x90\x30\x5d\x10\x3f\xca\x05", 11)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), to_RR(ZZFromBytes((uchar*)"\x03\x4c\x67\x06\x0f\x87\xde\x88\x50\xee\x06", 11)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), -to_RR(ZZFromBytes((uchar*)"\x17\xb8\x6f\x6a\xce\xd1\x7d\xb0\x27\x59\x07", 11)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), to_RR(ZZFromBytes((uchar*)"\xa9\x95\xf4\x44\x36\x41\xb4\x48\x25\xe7\x06", 11)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), -to_RR(ZZFromBytes((uchar*)"\x3d\x5c\xad\xf6\x46\x61\xb8\x78\x25\xbe\x05", 11)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), to_RR(ZZFromBytes((uchar*)"\x65\x4f\x8a\xe0\xde\x53\x28\xa4\xa3\x39\x04", 11)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), -to_RR(ZZFromBytes((uchar*)"\x61\x84\xe0\x52\x44\x90\x54\xdf\x1d\xbe\x02", 11)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), to_RR(ZZFromBytes((uchar*)"\xa9\xdd\x97\x03\x13\x60\xbd\x62\xb8\x90\x01", 11)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), -to_RR(ZZFromBytes((uchar*)"\x2d\x8e\x3a\xca\x1a\xc5\x0f\x64\x23\xc8", 10)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), to_RR(ZZFromBytes((uchar*)"\xe5\x23\x98\x5f\xa9\xde\x70\xc1\xed\x56", 10)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), -to_RR(ZZFromBytes((uchar*)"\x91\x8d\x33\x72\xa2\x34\x42\x70\x91\x20", 10)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), to_RR(ZZFromBytes((uchar*)"\x45\x92\x31\x99\x79\x8c\x2d\xb6\x69\x0a", 10)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), -to_RR(ZZFromBytes((uchar*)"\xe9\xb6\xd4\xfa\x31\x5a\xf2\x20\xcd\x02", 10)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), to_RR(ZZFromBytes((uchar*)"\x91\x3b\xd1\x96\x19\x93\x0c\x3f\x9f", 9)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), -to_RR(ZZFromBytes((uchar*)"\x7d\x24\xcf\x21\x9d\x8e\xed\x6a\x1c", 9)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), to_RR(ZZFromBytes((uchar*)"\xf5\x97\x2c\x22\x23\x43\xcf\xea\x03", 9)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), -to_RR(ZZFromBytes((uchar*)"\x89\x23\xe4\xd1\x13\xec\x38\x64", 8)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), to_RR(ZZFromBytes((uchar*)"\x01\x3f\x61\x6c\x7a\x61\x76\x06", 8)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), -to_RR(ZZFromBytes((uchar*)"\x1d\x66\x81\xf8\x44\xac\x33", 7)) / to_RR(ZZFromBytes((uchar*)"\x00\x00\x00\x00\x00\x00\x00\x02", 8))}}
+            {15, {RR(0), to_RR(ZZFromBytes((uchar *) "\x23\x19", 2)) / to_RR(ZZFromBytes((uchar *) "\x00\x08", 2)), RR(
+                    0), -to_RR(ZZFromBytes((uchar *) "\xa7\x3a", 2)) / to_RR(ZZFromBytes((uchar *) "\x00\x08", 2)), RR(
+                    0), to_RR(ZZFromBytes((uchar *) "\x93\x69", 2)) / to_RR(ZZFromBytes((uchar *) "\x00\x08", 2)), RR(
+                    0), -to_RR(ZZFromBytes((uchar *) "\xaf\x7d", 2)) / to_RR(ZZFromBytes((uchar *) "\x00\x08", 2)), RR(
+                    0), to_RR(ZZFromBytes((uchar *) "\xc1\x61", 2)) / to_RR(ZZFromBytes((uchar *) "\x00\x08", 2)), RR(
+                    0), -to_RR(ZZFromBytes((uchar *) "\xfd\x2f", 2)) / to_RR(ZZFromBytes((uchar *) "\x00\x08", 2)), RR(
+                    0), to_RR(ZZFromBytes((uchar *) "\x89\x0d", 2)) / to_RR(ZZFromBytes((uchar *) "\x00\x08", 2)), RR(
+                    0), -to_RR(ZZFromBytes((uchar *) "\xad\x01", 2)) / to_RR(ZZFromBytes((uchar *) "\x00\x08", 2))}},
+            {31, {RR(0), to_RR(ZZFromBytes((uchar *) "\x23\xe1\xe9\x11", 4)) /
+                         to_RR(ZZFromBytes((uchar *) "\x00\x00\x00\x04", 4)),                                       RR(
+                    0), -to_RR(ZZFromBytes((uchar *) "\xaf\x65\x91\x59", 4)) /
+                        to_RR(ZZFromBytes((uchar *) "\x00\x00\x00\x04", 4)),                                        RR(
+                    0), to_RR(ZZFromBytes((uchar *) "\xdf\x77\x2f\x78\x01", 5)) /
+                        to_RR(ZZFromBytes((uchar *) "\x00\x00\x00\x04", 4)),                                       RR(
+                    0), -to_RR(ZZFromBytes((uchar *) "\xe3\x29\x62\x8c\x04", 5)) /
+                        to_RR(ZZFromBytes((uchar *) "\x00\x00\x00\x04", 4)),                                        RR(
+                    0), to_RR(ZZFromBytes((uchar *) "\x67\x0c\xe5\x9c\x0a", 5)) /
+                        to_RR(ZZFromBytes((uchar *) "\x00\x00\x00\x04", 4)),                                       RR(
+                    0), -to_RR(ZZFromBytes((uchar *) "\x53\x16\x69\x1a\x13", 5)) /
+                        to_RR(ZZFromBytes((uchar *) "\x00\x00\x00\x04", 4)),                                        RR(
+                    0), to_RR(ZZFromBytes((uchar *) "\xa3\x95\xbb\xf0\x1a", 5)) /
+                        to_RR(ZZFromBytes((uchar *) "\x00\x00\x00\x04", 4)),                                       RR(
+                    0), -to_RR(ZZFromBytes((uchar *) "\xa7\x47\xee\x04\x1e", 5)) /
+                        to_RR(ZZFromBytes((uchar *) "\x00\x00\x00\x04", 4)),                 RR(0),
+                                                                                                    to_RR(ZZFromBytes(
+                                                                                                            (uchar *) "\x39\x3f\xd2\x7c\x1a",
+                                                                                                            5)) /
+                                                                                                    to_RR(ZZFromBytes(
+                                                                                                            (uchar *) "\x00\x00\x00\x04",
+                                                                                                            4)), RR(0),
+                         -to_RR(ZZFromBytes((uchar *) "\x7d\x30\xd1\x6e\x12", 5)) /
+                         to_RR(ZZFromBytes((uchar *) "\x00\x00\x00\x04", 4)),                 RR(0),
+                                                                                                     to_RR(ZZFromBytes(
+                                                                                                             (uchar *) "\x8d\xc2\xa4\x01\x0a",
+                                                                                                             5)) /
+                                                                                                     to_RR(ZZFromBytes(
+                                                                                                             (uchar *) "\x00\x00\x00\x04",
+                                                                                                             4)), RR(0),
+                         -to_RR(ZZFromBytes((uchar *) "\xb9\xf9\x21\x27\x04", 5)) /
+                         to_RR(ZZFromBytes((uchar *) "\x00\x00\x00\x04", 4)),                 RR(0),
+                                                                                                     to_RR(ZZFromBytes(
+                                                                                                             (uchar *) "\x7d\x01\x07\x46\x01",
+                                                                                                             5)) /
+                                                                                                     to_RR(ZZFromBytes(
+                                                                                                             (uchar *) "\x00\x00\x00\x04",
+                                                                                                             4)), RR(0),
+                         -to_RR(ZZFromBytes((uchar *) "\xc1\xf9\xa9\x45", 4)) /
+                         to_RR(ZZFromBytes((uchar *) "\x00\x00\x00\x04", 4)),                 RR(0),
+                                                                                                     to_RR(ZZFromBytes(
+                                                                                                             (uchar *) "\xb1\x01\x44\x09",
+                                                                                                             4)) /
+                                                                                                     to_RR(ZZFromBytes(
+                                                                                                             (uchar *) "\x00\x00\x00\x04",
+                                                                                                             4)), RR(0),
+                         -to_RR(ZZFromBytes((uchar *) "\x7d\xee\x93", 3)) /
+                         to_RR(ZZFromBytes((uchar *) "\x00\x00\x00\x04", 4))}},
+            {63, {RR(0), to_RR(ZZFromBytes((uchar *) "\x23\x21\xd8\x27\xf9\x64\xb7\x0c", 8)) /
+                         to_RR(ZZFromBytes((uchar *) "\x00\x00\x00\x00\x00\x00\x00\x02", 8)),                       RR(
+                    0), -to_RR(ZZFromBytes((uchar *) "\xbf\xab\x0e\xf1\x63\x13\x67\x83", 8)) /
+                        to_RR(ZZFromBytes((uchar *) "\x00\x00\x00\x00\x00\x00\x00\x02", 8)),                        RR(
+                    0), to_RR(ZZFromBytes((uchar *) "\xb7\x09\x84\x79\x83\xae\x9f\x9e\x04", 9)) /
+                        to_RR(ZZFromBytes((uchar *) "\x00\x00\x00\x00\x00\x00\x00\x02", 8)),                       RR(
+                    0), -to_RR(ZZFromBytes((uchar *) "\xcb\xb0\x8f\xa8\x42\x47\xbc\xe5\x1f", 9)) /
+                        to_RR(ZZFromBytes((uchar *) "\x00\x00\x00\x00\x00\x00\x00\x02", 8)),                        RR(
+                    0), to_RR(ZZFromBytes((uchar *) "\xc3\x50\x0e\xeb\x6a\xa0\xe4\xa9\xad", 9)) /
+                        to_RR(ZZFromBytes((uchar *) "\x00\x00\x00\x00\x00\x00\x00\x02", 8)),                       RR(
+                    0), -to_RR(ZZFromBytes((uchar *) "\x2f\xd9\xd8\x90\x92\x0a\x0e\x47\xff\x02", 10)) /
+                        to_RR(ZZFromBytes((uchar *) "\x00\x00\x00\x00\x00\x00\x00\x02", 8)),                        RR(
+                    0), to_RR(ZZFromBytes((uchar *) "\x57\x1c\x1b\x13\xc4\x26\xde\x59\xfd\x0a", 10)) /
+                        to_RR(ZZFromBytes((uchar *) "\x00\x00\x00\x00\x00\x00\x00\x02", 8)),                       RR(
+                    0), -to_RR(ZZFromBytes((uchar *) "\x7b\x88\x3b\xc1\x15\xfe\xc7\xfd\x03\x22", 10)) /
+                        to_RR(ZZFromBytes((uchar *) "\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), to_RR(
+                    ZZFromBytes((uchar *) "\xaf\xd2\xd9\x59\xfd\x09\xb7\x90\x0a\x5a", 10)) / to_RR(ZZFromBytes(
+                    (uchar *) "\x00\x00\x00\x00\x00\x00\x00\x02", 8)),                                           RR(0),
+                         -to_RR(ZZFromBytes((uchar *) "\xdb\xa5\xc6\x25\x91\xa3\x69\x43\xe2\xcd", 10)) /
+                         to_RR(ZZFromBytes((uchar *) "\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), to_RR(
+                            ZZFromBytes((uchar *) "\x13\x60\x16\x9e\x67\x87\xef\x8f\xce\x99\x01", 11)) /
+                                                                                                     to_RR(ZZFromBytes(
+                                                                                                             (uchar *) "\x00\x00\x00\x00\x00\x00\x00\x02",
+                                                                                                             8)), RR(0),
+                         -to_RR(ZZFromBytes((uchar *) "\x17\x32\xe2\xd9\xc8\xd7\x67\xd1\x53\xca\x02", 11)) /
+                         to_RR(ZZFromBytes((uchar *) "\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), to_RR(
+                            ZZFromBytes((uchar *) "\xdf\x5d\xe3\x1a\x56\xc2\x27\x52\x4d\x47\x04", 11)) /
+                                                                                                     to_RR(ZZFromBytes(
+                                                                                                             (uchar *) "\x00\x00\x00\x00\x00\x00\x00\x02",
+                                                                                                             8)), RR(0),
+                         -to_RR(ZZFromBytes((uchar *) "\x5b\x50\x2f\x3d\x90\x30\x5d\x10\x3f\xca\x05", 11)) /
+                         to_RR(ZZFromBytes((uchar *) "\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0), to_RR(
+                            ZZFromBytes((uchar *) "\x03\x4c\x67\x06\x0f\x87\xde\x88\x50\xee\x06", 11)) /
+                                                                                                     to_RR(ZZFromBytes(
+                                                                                                             (uchar *) "\x00\x00\x00\x00\x00\x00\x00\x02",
+                                                                                                             8)), RR(0),
+                         -to_RR(ZZFromBytes((uchar *) "\x17\xb8\x6f\x6a\xce\xd1\x7d\xb0\x27\x59\x07", 11)) /
+                         to_RR(ZZFromBytes((uchar *) "\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0),
+                         to_RR(ZZFromBytes((uchar *) "\xa9\x95\xf4\x44\x36\x41\xb4\x48\x25\xe7\x06", 11)) /
+                         to_RR(ZZFromBytes((uchar *) "\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0),
+                         -to_RR(ZZFromBytes((uchar *) "\x3d\x5c\xad\xf6\x46\x61\xb8\x78\x25\xbe\x05", 11)) /
+                         to_RR(ZZFromBytes((uchar *) "\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0),
+                         to_RR(ZZFromBytes((uchar *) "\x65\x4f\x8a\xe0\xde\x53\x28\xa4\xa3\x39\x04", 11)) /
+                         to_RR(ZZFromBytes((uchar *) "\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0),
+                         -to_RR(ZZFromBytes((uchar *) "\x61\x84\xe0\x52\x44\x90\x54\xdf\x1d\xbe\x02", 11)) /
+                         to_RR(ZZFromBytes((uchar *) "\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0),
+                         to_RR(ZZFromBytes((uchar *) "\xa9\xdd\x97\x03\x13\x60\xbd\x62\xb8\x90\x01", 11)) /
+                         to_RR(ZZFromBytes((uchar *) "\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0),
+                         -to_RR(ZZFromBytes((uchar *) "\x2d\x8e\x3a\xca\x1a\xc5\x0f\x64\x23\xc8", 10)) /
+                         to_RR(ZZFromBytes((uchar *) "\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0),
+                         to_RR(ZZFromBytes((uchar *) "\xe5\x23\x98\x5f\xa9\xde\x70\xc1\xed\x56", 10)) /
+                         to_RR(ZZFromBytes((uchar *) "\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0),
+                         -to_RR(ZZFromBytes((uchar *) "\x91\x8d\x33\x72\xa2\x34\x42\x70\x91\x20", 10)) /
+                         to_RR(ZZFromBytes((uchar *) "\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0),
+                         to_RR(ZZFromBytes((uchar *) "\x45\x92\x31\x99\x79\x8c\x2d\xb6\x69\x0a", 10)) /
+                         to_RR(ZZFromBytes((uchar *) "\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0),
+                         -to_RR(ZZFromBytes((uchar *) "\xe9\xb6\xd4\xfa\x31\x5a\xf2\x20\xcd\x02", 10)) /
+                         to_RR(ZZFromBytes((uchar *) "\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0),
+                         to_RR(ZZFromBytes((uchar *) "\x91\x3b\xd1\x96\x19\x93\x0c\x3f\x9f", 9)) /
+                         to_RR(ZZFromBytes((uchar *) "\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0),
+                         -to_RR(ZZFromBytes((uchar *) "\x7d\x24\xcf\x21\x9d\x8e\xed\x6a\x1c", 9)) /
+                         to_RR(ZZFromBytes((uchar *) "\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0),
+                         to_RR(ZZFromBytes((uchar *) "\xf5\x97\x2c\x22\x23\x43\xcf\xea\x03", 9)) /
+                         to_RR(ZZFromBytes((uchar *) "\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0),
+                         -to_RR(ZZFromBytes((uchar *) "\x89\x23\xe4\xd1\x13\xec\x38\x64", 8)) /
+                         to_RR(ZZFromBytes((uchar *) "\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0),
+                         to_RR(ZZFromBytes((uchar *) "\x01\x3f\x61\x6c\x7a\x61\x76\x06", 8)) /
+                         to_RR(ZZFromBytes((uchar *) "\x00\x00\x00\x00\x00\x00\x00\x02", 8)), RR(0),
+                         -to_RR(ZZFromBytes((uchar *) "\x1d\x66\x81\xf8\x44\xac\x33", 7)) /
+                         to_RR(ZZFromBytes((uchar *) "\x00\x00\x00\x00\x00\x00\x00\x02", 8))}}
     };
     std::map<int, std::vector<double>> baseline_map =
-    {
             {
-                    15, {0, 3.14208984375,     0, -7.33154296875,      0, 13.19677734375,    0, -15.71044921875,
-                                                                                                                     0, 12.21923828125,     0, -5.99853515625,      0, 1.69189453125,      0, -0.20947265625}
-            },
-            {
-                    31, {0, 4.478397890925407, 0, -22.391989454627037, 0, 94.04635570943356, 0, -291.0958629101515,  0,
-                                                                                                                        679.2236801236868,  0, -1222.6026242226362, 0, 1724.1831880062819, 0, -1921.2326952069998, 0,
-                                1695.205319300294, 0, -1179.704286530614, 0, 640.4108984023333,  0, -265.78317917883396, 0,
-                                81.50684161484241, 0, -17.41599179804325,  0, 2.316412702202797,  0, -0.14446444809436798}
-            },
-            {
-                    63, {0, 6.358192239869881, 0, -65.70131981198877,  0, 591.311878307899,  0, -4082.8677311735883, 0,
-                                                                                                                        22228.946536389536, 0, -98211.52742441195,  0, 360108.93388951046, 0, -1114622.8906103896, 0,
-                                2950472.35749809,  0, -6746401.706326042, 0, 13428551.967829932, 0, -23407080.70281818,  0,
-                                35890857.07765454, 0, -48570248.182011135, 0, 58140740.434624165, 0, -61641688.24574132, 0,
-                                57905828.35206003, 0, -48173756.36011717, 0, 35443154.078764886, 0, -23006959.66516317, 0,
-                                13130801.369873613, 0, -6558130.030800664, 0, 2848480.7204487734, 0, -1067192.1293078198, 0,
-                                341211.0889623641, 0, -91792.47334438503, 0, 20383.52455978361, 0, -3637.463978681924, 0,
-                                501.4048090914933, 0, -50.11117612778805, 0, 3.2312124497699397, 0, -0.10092368634714097}
-            }
-    };
-    for(auto &k : coeff_map){
+                    {
+                            15, {0, 3.14208984375,     0, -7.33154296875,      0, 13.19677734375,    0, -15.71044921875,
+                                                                                                                             0, 12.21923828125,     0, -5.99853515625,      0, 1.69189453125,      0, -0.20947265625}
+                    },
+                    {
+                            31, {0, 4.478397890925407, 0, -22.391989454627037, 0, 94.04635570943356, 0, -291.0958629101515,  0,
+                                                                                                                                679.2236801236868,  0, -1222.6026242226362, 0, 1724.1831880062819, 0, -1921.2326952069998, 0,
+                                        1695.205319300294, 0, -1179.704286530614, 0, 640.4108984023333,  0, -265.78317917883396, 0,
+                                        81.50684161484241, 0, -17.41599179804325,  0, 2.316412702202797,  0, -0.14446444809436798}
+                    },
+                    {
+                            63, {0, 6.358192239869881, 0, -65.70131981198877,  0, 591.311878307899,  0, -4082.8677311735883, 0,
+                                                                                                                                22228.946536389536, 0, -98211.52742441195,  0, 360108.93388951046, 0, -1114622.8906103896, 0,
+                                        2950472.35749809,  0, -6746401.706326042, 0, 13428551.967829932, 0, -23407080.70281818,  0,
+                                        35890857.07765454, 0, -48570248.182011135, 0, 58140740.434624165, 0, -61641688.24574132, 0,
+                                        57905828.35206003, 0, -48173756.36011717, 0, 35443154.078764886, 0, -23006959.66516317, 0,
+                                        13130801.369873613, 0, -6558130.030800664, 0, 2848480.7204487734, 0, -1067192.1293078198, 0,
+                                        341211.0889623641, 0, -91792.47334438503, 0, 20383.52455978361, 0, -3637.463978681924, 0,
+                                        501.4048090914933, 0, -50.11117612778805, 0, 3.2312124497699397, 0, -0.10092368634714097}
+                    }
+            };
+    for (auto &k: coeff_map) {
         auto &RR_vec = k.second;
         auto &double_vec = baseline_map.at(k.first);
-        if(RR_vec.size() != double_vec.size()){
+        if (RR_vec.size() != double_vec.size()) {
             fprintf(stderr, "size mismatch\n");
             return 1;
         }
         int len = RR_vec.size();
-        for(int i = 0; i < len; i++){
-            if(fabs(to_double(RR_vec[i]) - double_vec[i]) > 0.1){
+        for (int i = 0; i < len; i++) {
+            if (fabs(to_double(RR_vec[i]) - double_vec[i]) > 0.1) {
                 fprintf(stderr, "coeffs mismatch: RR=%f double=%f\n", to_double(RR_vec[i]), double_vec[i]);
                 return 1;
             }
@@ -552,10 +781,18 @@ int main() {
 
     std::vector<std::thread> threads;
 
-    TestParams testParams[] = {
+    TestModParams testModParams[] = {
             {
-                    3, 8, 31, 1, RR(pow(2.0, -4)), RR(pow(2.0, -7)), true, "2_12_31_-4_-7_RR"
-            },
+                    30, logQ, 4,
+                    1, 3, 3, 31, 31, 31,
+                    8, 1, RR(pow(2.0, -4)), RR(0.5), "pm_test", false
+            }
+    };
+
+    TestBootParams testBootParams[] = {
+//            {
+//                    3, 8, 31, 1, RR(pow(2.0, -4)), RR(pow(2.0, -7)), "2_12_31_-4_-7_RR"
+//            },
 //           {
 //                   3, 8, 31, 1, RR(pow(2.0, -4)), RR(pow(2.0, -10)), true, "2_12_31_-4_-10"
 //           },
@@ -567,12 +804,21 @@ int main() {
 //           }
     };
 
-    for (auto &param: testParams) {
+    for (auto &param: testModParams) {
+        threads.emplace_back(test_precise_mod,
+                             std::ref(scheme), std::ref(secretKey), param.logp, param.logq, param.logSlots,
+                             param.K, param.modulus, param.eps,
+                             param.n_iter_mod_inner, param.n_iter_mod_outer, param.n_iter_sign,
+                             param.deg_mod_inner, param.deg_mod_outer, param.deg_sign, param.precise,
+                             param.repeat, param.fname
+        );
+    }
+    for (auto &param: testBootParams) {
         threads.emplace_back(testBootstrap,
                              std::ref(secretKey), std::ref(scheme), std::ref(ring),
                              logq, logp, logn, logT,
                              param.K, param.n_iter, param.deg, param.modulus, param.eps,
-                             param.repeat, param.enable_boot, param.fname);
+                             param.repeat, param.fname);
     }
     for (auto &e: threads)
         e.join();
