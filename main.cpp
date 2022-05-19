@@ -97,7 +97,7 @@ Ciphertext homo_eval_mod(Scheme &scheme, Ciphertext &ciphertext, int n_iter, int
 
     Ciphertext res = ciphertext;
     bool init = false;
-    RR range = (K + 2) * modulus;
+    RR range = (K + 0.5) * modulus;
     auto logp = ciphertext.logp;
     std::mutex mutex; // writer lock for init and res
     int dK = 2 * K;
@@ -554,7 +554,7 @@ int main() {
 
     TestParams testParams[] = {
             {
-                    3, 8, 31, 1, RR(pow(2.0, -4)), RR(pow(2.0, -7)), true, "2_12_31_-4_-7"
+                    3, 8, 31, 1, RR(pow(2.0, -4)), RR(pow(2.0, -7)), true, "2_12_31_-4_-7_RR"
             },
 //           {
 //                   3, 8, 31, 1, RR(pow(2.0, -4)), RR(pow(2.0, -10)), true, "2_12_31_-4_-10"
