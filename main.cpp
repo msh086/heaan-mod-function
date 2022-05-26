@@ -83,6 +83,7 @@ void homo_eval_poly(Scheme &scheme, Ciphertext &dst, std::vector<T> &coeffs) {
 /*
  * is inplace safe
  * evaluate a polynomial of degree `deg` for n_iter + 1 times
+ * levels = ceil(log2(deg+1)) * (n_iter + 1) = 20 for deg=32 and n_iter=3
  */
 void homo_eval_sign(Scheme &scheme, Ciphertext &dst, const Ciphertext &ciphertext, int n_iter, int deg) {
     auto &coeffs = coeff_map.at(deg);
@@ -120,6 +121,7 @@ void plain_eval_poly(complex<double> *dst, const complex<double> *src, int len, 
 
 /*
  * is inplace safe
+ * levels = levels of sign + 2 = 22
  */
 void homo_eval_mod(Scheme &scheme, Ciphertext &dst, const Ciphertext &ciphertext, int n_iter, int K, const RR &modulus,
                    int deg) {
@@ -184,6 +186,7 @@ void homo_eval_mod(Scheme &scheme, Ciphertext &ciphertext, int n_iter, int K, co
 
 
 // is inplace safe
+// levels = 1 + 11 + 22 + 1 = 35
 void homo_eval_mod_precise(Scheme &scheme, Ciphertext &dst, const Ciphertext &ciphertext,
                            int n_iter_mod_inner, int n_iter_mod_outer, int n_iter_sign, int K, const RR &modulus,
                            int deg_mod_inner, int deg_mod_outer, int deg_sign) {
@@ -219,6 +222,7 @@ void homo_eval_mod_precise(Scheme &scheme, Ciphertext &dst, const Ciphertext &ci
     scheme.addConstAndEqual(b, 1, logp);
     scheme.multAndEqual(move_right, b);
     scheme.addAndEqual(dst, move_right);
+	scheme.reScaleByAndEqual(dst, logp); // lazy rescaling
 }
 
 
@@ -239,7 +243,7 @@ void plain_eval_sign(complex<double> *dst, const complex<double> *src, int len, 
 }
 
 
-// not inplace-safe
+// inplace-safe
 void plain_eval_mod(complex<double> *dst, const complex<double> *src, int len, int n_iter, int K, double modulus, int deg) {
 	bool same_obj = dst == src;
 	auto res = same_obj ? (new complex<double>[len]) : dst;
@@ -301,6 +305,7 @@ void plain_eval_mod_precise(complex<double> *dst, const complex<double> *src, in
 }
 
 
+// levels = levels of mod + 2 = 24
 double
 evalExpAndEqualNew(Scheme &scheme, Ring &ring, Ciphertext &cipher, long logT, long logI, int n_iter, int K, int deg) {
     long slots = cipher.n;
@@ -369,13 +374,14 @@ void sample_mod(std::vector<complex<double>> &mod_input, std::vector<complex<dou
 }
 
 
-void test_precise_mod(Scheme &scheme, SecretKey &secretKey, long logp, long logq, long logSlots,
-                      int K, const RR &modulus, const RR &eps,
+void test_precise_mod(Scheme &scheme, SecretKey &secretKey, long logq, long logp, long logSlots,
+                      int K, const RR &modulus, const RR& eps,
                       int n_iter_mod_inner, int n_iter_mod_outer, int n_iter_sign,
                       int deg_mod_inner, int deg_mod_outer, int deg_sign, bool precise = true, int repeat = 1, const std::string &filename = "") {
     long slots = (1 << logSlots);
     std::vector<complex<double>> mod_input(slots);
     std::vector<complex<double>> expected(slots);
+	// RR eps = RR(logq) / logq;
 
     FILE *output = stdout;
     if (filename.length())
@@ -430,11 +436,11 @@ void test_precise_mod(Scheme &scheme, SecretKey &secretKey, long logp, long logq
 
 // taylor approx in [-1/T, 1/T]
 /**
- *
+ * total levels consumed ~= 24
  * @param secretKey the secret key
  * @param scheme the ckks scheme
  * @param logq log2 of q=ciphertext modulus
- * @param logp log2 of p=scaling factor
+ * @param logp log2 of p=the magnitude of underlying message (which should be identical to the scaling factor)
  * @param logSlots log2 of number of slots
  * @param logT for bootstrapping
  * @param K number of intervals (half)
@@ -449,8 +455,10 @@ void test_precise_mod(Scheme &scheme, SecretKey &secretKey, long logp, long logq
  */
 void testBootstrap(SecretKey &secretKey, Scheme &scheme, Ring &ring,
                    long logq, long logp, long logSlots, long logT,
-                   int K, int n_iter, int deg, const RR &eps, int repeat = 1, const std::string &filename = "") {
+                   int K, int n_iter, int deg, int repeat = 1, const std::string &filename = "") {
     long slots = (1 << logSlots);
+	RR eps = pow(RR(2), RR(logp - logq));
+	printf("eps = %f\n", to_double(eps));
     FILE *output = stdout;
     if (filename.length())
         output = fopen(filename.c_str(), "w");
@@ -466,10 +474,12 @@ void testBootstrap(SecretKey &secretKey, Scheme &scheme, Ring &ring,
 		}
 		Ciphertext cipher;
 		scheme.encryptMsg(cipher, bounded_ptxt);
+		// use the plaintext before encryption
 		Plaintext actual_ptxt(logp, logq, slots);
 		for (int i = 0; i < N; i += Nh / slots)
 			actual_ptxt.mx[i] = bounded_ptxt.mx[i] >> logQ;
 		// auto mvec = scheme.decode(actual_ptxt);
+		// scheme.decryptMsg(actual_ptxt, secretKey, cipher);
 
 
 		printf("before boot: logp = %ld, logq = %ld\n", cipher.logp, cipher.logq);
@@ -503,7 +513,7 @@ void testBootstrap(SecretKey &secretKey, Scheme &scheme, Ring &ring,
 
 		Ciphertext mod_boot_out_real(cipher);
 		double time_for_mod = evalExpAndEqualNew(scheme, ring, mod_boot_out_real, logT, 4, n_iter, K, deg);
-		fprintf(output, "time for mod: %f\n s", time_for_mod);
+		fprintf(output, "time for mod: %f s\n", time_for_mod);
 		printf("after mod new: logp = %ld, logq = %ld\n", mod_boot_out_real.logp, mod_boot_out_real.logq);
 		scheme.evalExpAndEqual(cipher, logT); // TODO update to RR too
 
@@ -550,6 +560,7 @@ void testBootstrap(SecretKey &secretKey, Scheme &scheme, Ring &ring,
 			NTL::rem(expected, expected, q0);
 			if (NTL::NumBits(expected) >= logq)
 				expected -= q0;
+			
 			auto got = dmsg.mx[i];
 			NTL::rem(got, got, q1);
 			if (NTL::NumBits(got) >= dmsg.logq)
@@ -577,7 +588,7 @@ void testBootstrap(SecretKey &secretKey, Scheme &scheme, Ring &ring,
 }
 
 struct TestModParams {
-    long logp, logq, logSlots;
+    long logq, logp, logSlots;
     int n_iter_sign, n_iter_mod_inner, n_iter_mod_outer, deg_sign, deg_mod_inner, deg_mod_outer;
     int K, repeat, threads;
     RR modulus, eps;
@@ -586,9 +597,8 @@ struct TestModParams {
 };
 
 struct TestBootParams {
-    long logp, logq, logSlots;
+    long logq, logp, logSlots;
     int n_iter, K, deg, repeat, threads;
-    RR eps;
     std::string fname;
 };
 
@@ -769,8 +779,8 @@ int main() {
   */
 
     // Parameters //
-    long logq = 90; ///< Ciphertext modulus (this value should be <= logQ in "scr/Params.h")
-    long logp = 80; ///< Scaling Factor (larger logp will give you more accurate value)
+    long logq = 40; ///< Ciphertext modulus (this value should be <= logQ in "scr/Params.h")
+    long logp = 30; ///< Scaling Factor (larger logp will give you more accurate value)
     long logn = 3; ///< number of slot (this value should be < logNh in "src/Params.h")
 
     long logT = 4;
@@ -792,67 +802,88 @@ int main() {
 
     std::vector<std::thread> threads;
 
+	// 35 levels, each of logp bits
     TestModParams testModParams[] = {
-            // {
-                    // 30, logQ, logNh,
-                    // 1, 3, 3, 31, 31, 31,
-                    // 8, 1, RR(pow(2.0, -4)), RR(pow(2.0,-1)), true, "pm_test"
-            // },
+            {
+                    30, logQ, logNh,
+                    1, 3, 3, 31, 31, 31,
+                    8, 1, 1,
+					RR(pow(2.0, -4)), RR(pow(2.0,-1)), false, "p_30"
+            },
     };
+	
+	// logq -- logQ, eps = -5, remaining = 136
+	// 40	1300
+	// 50   1560
+    // 60   1820
+	// 70   2080
+	// 80   2340
+	// 90	2600
+	// 100	2860
 
+	// 26 levels, each of logp + 4 bits
     TestBootParams testBootParams[] = {
 		// logp, logq, logSlots, n_iter, K, deg, repeat, threads, eps, fname
-		// eps group
+		// logq test group
 		  // {
-				  // logp, logq, logn, 3, 8, 31, 1, RR(pow(2.0, -4)), RR(pow(2.0, -10)), "3_8_31_-4_-10"
+				  // logq, logq - 5, 3, 3, 8, 31, 1, 1, "logq/40_1300"
 		  // },
+		// eps test group
 		  // {
-				  // logp, logq, logn, 3, 8, 31, 1, RR(pow(2.0, -4)), RR(pow(2.0, -9)), "3_8_31_-4_-9"
+				  // logq, logq - 10, 3, 3, 8, 31, 1, 1, "eps/10"
+		  // },                                            
+		  // {                                             
+				  // logq, logq - 9, 3, 3, 8, 31, 1, 1, "eps/9"
+		  // },                                            
+		   // {                                            
+				  // logq, logq - 8, 3, 3, 8, 31, 1, 1, "eps/8"
+		   // },                                           
+		  // {                                             
+				  // logq, logq - 7, 3, 3, 8, 31, 1, 1, "eps/7"
+		  // },                                            
+		  // {                                             
+				  // logq, logq - 6, 3, 3, 8, 31, 1, 1, "eps/6"
+		  // },                                            
+		  // {                                             
+				  // logq, logq - 5, 3, 3, 8, 31, 1, 1, "eps/5"
+		  // },                                            
+		  // {                                             
+				  // logq, logq - 4, 3, 3, 8, 31, 1, 1, "eps/4"
 		  // },
-		   // {
-				   // logp, logq, logn, 3, 8, 31, 1, RR(pow(2.0, -4)), RR(pow(2.0, -8)), "3_8_31_-4_-8"
-		   // },
-		  // {
-				  // logp, logq, logn, 3, 8, 31, 1, RR(pow(2.0, -4)), RR(pow(2.0, -7)), "3_8_31_-4_-7"
-		  // },
-		  // {
-				  // logp, logq, logn, 3, 8, 31, 1, RR(pow(2.0, -4)), RR(pow(2.0, -6)), "3_8_31_-4_-6"
-		  // },
-		  // {
-				  // logp, logq, logn, 3, 8, 31, 1, RR(pow(2.0, -4)), RR(pow(2.0, -5)), "3_8_31_-4_-5"
-		  // },
-		  // {
-				  // logp, logq, logn, 3, 8, 31, 1, RR(pow(2.0, -4)), RR(pow(2.0, -4)), "3_8_31_-4_-4"
-		  // }
 		// logSlots test group
-		  {
-				  logp, logq, 3, 3, 8, 31, 1, 1, RR(pow(2.0, -7)), "logSlots/3"
-		  },
-		  {
-				  logp, logq, 4, 3, 8, 31, 1, 1, RR(pow(2.0, -7)), "logSlots/4"
-		  },
-		  {
-				  logp, logq, 5, 3, 8, 31, 1, 1, RR(pow(2.0, -7)), "logSlots/5"
-		  },
-		  {
-				  logp, logq, 6, 3, 8, 31, 1, 1, RR(pow(2.0, -7)), "logSlots/6"
-		  },
-		  {
-			  logp, logq, 7, 3, 8, 31, 1, 1, RR(pow(2.0, -7)), "logSlots/7"
-		  },
+		  // {
+				// logq, logq - 7, 3, 3, 8, 31, 1, 1, "logSlots/3"
+		  // },
+		  // {
+				// logq, logq - 7, 4, 3, 8, 31, 1, 1, "logSlots/4"
+		  // },
+		  // {
+				// logq, logq - 7, 5, 3, 8, 31, 1, 1, "logSlots/5"
+		  // },
+		  // {
+				// logq, logq - 7, 6, 3, 8, 31, 1, 1, "logSlots/6"
+		  // },
+		  // {
+				// logq, logq - 7, 7, 3, 8, 31, 1, 1, "logSlots/7"
+		  // },
     };
 	
 	int max_threads = 2;
 
     for (auto &param: testModParams) {
-		for(int i = 0; i < param.threads; i++)
+		for(int i = 0; i < param.threads; i++) {
+			while(alive_threads >= max_threads){
+				std::this_thread::sleep_for(seconds(1));
+			}
 			threads.emplace_back(test_precise_mod,
-								 std::ref(scheme), std::ref(secretKey), param.logp, param.logq, param.logSlots,
+								 std::ref(scheme), std::ref(secretKey), param.logq, param.logp, param.logSlots,
 								 param.K, param.modulus, param.eps,
 								 param.n_iter_mod_inner, param.n_iter_mod_outer, param.n_iter_sign,
 								 param.deg_mod_inner, param.deg_mod_outer, param.deg_sign, param.precise, param.repeat,
 								 param.fname + "_NO" + std::to_string(i)
 			);
+			alive_threads++;
+		}
     }
     for (auto &param: testBootParams) {
 		for(int i = 0; i < param.threads; i++) {
@@ -862,7 +893,7 @@ int main() {
 			threads.emplace_back(testBootstrap,
 								 std::ref(secretKey), std::ref(scheme), std::ref(ring),
 								 param.logq, param.logp, param.logSlots, logT,
-								 param.K, param.n_iter, param.deg, param.eps, param.repeat,
+								 param.K, param.n_iter, param.deg, param.repeat,
 								 param.fname + "_NO" + std::to_string(i)
 			 );
 			alive_threads++;
