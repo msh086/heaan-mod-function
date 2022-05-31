@@ -1,5 +1,18 @@
+diff --git a/HEAAN/lib/src/subdir.mk b/HEAAN/lib/src/subdir.mk
+index da56a12..ac4eade 100644
+--- a/HEAAN/lib/src/subdir.mk
++++ b/HEAAN/lib/src/subdir.mk
+@@ -56,7 +56,7 @@ CPP_DEPS += \
+ src/%.o: ../src/%.cpp
+ 	@echo 'Building file: $<'
+ 	@echo 'Invoking: GCC C++ Compiler'
+-	g++ -I/usr/local/include -O3 -c -std=c++11 -pthread -MMD -MP -MF"$(@:%.o=%.d)" -MT"$(@)" -o "$@" "$<"
++	g++ -I/usr/local/include -g -c -std=c++11 -pthread -MMD -MP -MF"$(@:%.o=%.d)" -MT"$(@)" -o "$@" "$<"
+ 	@echo 'Finished building: $<'
+ 	@echo ' '
+ 
 diff --git a/HEAAN/src/Ciphertext.cpp b/HEAAN/src/Ciphertext.cpp
-index 14a1a32..ffde34b 100644
+index 14a1a32..89c1cb4 100644
 --- a/HEAAN/src/Ciphertext.cpp
 +++ b/HEAAN/src/Ciphertext.cpp
 @@ -24,13 +24,13 @@ Ciphertext::Ciphertext(const Ciphertext& o) : logp(o.logp), logq(o.logq), n(o.n)
@@ -18,11 +31,40 @@ index 14a1a32..ffde34b 100644
  	copyParams(o);
  	for (long i = 0; i < N; ++i) {
  		ax[i] = o.ax[i];
+@@ -43,11 +43,20 @@ void Ciphertext::free() {
+ 		clear(ax[i]);
+ 		clear(bx[i]);
+ 	}
++    if(cx){
++        for(long i = 0; i < N; i++)
++            clear(cx[i]);
++    }
++}
++
++bool Ciphertext::relined() const{
++    return cx == nullptr;
+ }
+ 
+ Ciphertext::~Ciphertext() {
+ 	delete[] ax;
+ 	delete[] bx;
++    delete[] cx;
+ }
+ 
+ }  // namespace heaan
 diff --git a/HEAAN/src/Ciphertext.h b/HEAAN/src/Ciphertext.h
-index bd7fc78..8bc2292 100644
+index bd7fc78..61dce16 100644
 --- a/HEAAN/src/Ciphertext.h
 +++ b/HEAAN/src/Ciphertext.h
-@@ -30,9 +30,9 @@ public:
+@@ -20,6 +20,7 @@ public:
+ 
+ 	NTL::ZZ* ax = new NTL::ZZ[N];
+ 	NTL::ZZ* bx = new NTL::ZZ[N];
++    NTL::ZZ* cx = nullptr; // after ctxt multiplication
+ 
+ 	long logp;
+ 	long logq;
+@@ -30,12 +31,14 @@ public:
  
  	Ciphertext(const Ciphertext& o);
  
@@ -34,6 +76,11 @@ index bd7fc78..8bc2292 100644
  
  	void free();
  
++    bool relined() const;
++
+ 	virtual ~Ciphertext();
+ 
+ };
 diff --git a/HEAAN/src/EvaluatorUtils.cpp b/HEAAN/src/EvaluatorUtils.cpp
 index 4422404..0a7bab7 100644
 --- a/HEAAN/src/EvaluatorUtils.cpp
@@ -331,7 +378,7 @@ index b2aa285..d74eaff 100644
  	void encode(NTL::ZZ* mx, double* vals, long slots, long logp);
  
 diff --git a/HEAAN/src/Scheme.cpp b/HEAAN/src/Scheme.cpp
-index 0b1fa9a..cb6d2bc 100644
+index 0b1fa9a..1e4f098 100644
 --- a/HEAAN/src/Scheme.cpp
 +++ b/HEAAN/src/Scheme.cpp
 @@ -208,7 +208,7 @@ void Scheme::encode(Plaintext& plain, complex<double>* vals, long n, long logp,
@@ -352,7 +399,7 @@ index 0b1fa9a..cb6d2bc 100644
  	res.copyParams(cipher);
  	ring.negate(res.ax, cipher.ax);
  	ring.negate(res.bx, cipher.bx);
-@@ -391,14 +391,14 @@ void Scheme::negateAndEqual(Ciphertext& cipher) {
+@@ -391,36 +391,48 @@ void Scheme::negateAndEqual(Ciphertext& cipher) {
  	ring.negateAndEqual(cipher.bx);
  }
  
@@ -362,6 +409,12 @@ index 0b1fa9a..cb6d2bc 100644
  	res.copyParams(cipher1);
  	ring.add(res.ax, cipher1.ax, cipher2.ax, q);
  	ring.add(res.bx, cipher1.bx, cipher2.bx, q);
++    if(cipher2.cx || cipher1.cx){
++        res.cx = new ZZ[N];
++        ZZ* src1 = cipher1.cx ? cipher1.cx : res.cx;
++        ZZ* src2 = cipher2.cx ? cipher2.cx : res.cx;
++        ring.add(res.cx, src1, src2, q);
++    }
  }
  
 -void Scheme::addAndEqual(Ciphertext& cipher1, Ciphertext& cipher2) {
@@ -369,7 +422,13 @@ index 0b1fa9a..cb6d2bc 100644
  	ZZ q = ring.qpows[cipher1.logq];
  	ring.addAndEqual(cipher1.ax, cipher2.ax, q);
  	ring.addAndEqual(cipher1.bx, cipher2.bx, q);
-@@ -406,21 +406,21 @@ void Scheme::addAndEqual(Ciphertext& cipher1, Ciphertext& cipher2) {
++    if(cipher2.cx){
++        if(!cipher1.cx){
++            cipher1.cx = new ZZ[N];
++        }
++        ring.addAndEqual(cipher1.cx, cipher2.cx, q);
++    }
+ }
  
  //-----------------------------------------
  
@@ -394,7 +453,7 @@ index 0b1fa9a..cb6d2bc 100644
  	ZZ q = ring.qpows[cipher.logq];
  	ZZ cnstZZ = logp < 0 ? EvaluatorUtils::scaleUpToZZ(cnst.real(), cipher.logp) : EvaluatorUtils::scaleUpToZZ(cnst.real(), logp);
  	res.copy(cipher);
-@@ -433,7 +433,7 @@ void Scheme::addConstAndEqual(Ciphertext& cipher, double cnst, long logp) {
+@@ -433,7 +445,7 @@ void Scheme::addConstAndEqual(Ciphertext& cipher, double cnst, long logp) {
  	AddMod(cipher.bx[0], cipher.bx[0], cnstZZ, q);
  }
  
@@ -403,7 +462,7 @@ index 0b1fa9a..cb6d2bc 100644
  	ZZ q = ring.qpows[cipher.logq];
  	ZZ cnstZZ = logp < 0 ? EvaluatorUtils::scaleUpToZZ(cnst, cipher.logp) : EvaluatorUtils::scaleUpToZZ(cnst, logp);
  	AddMod(cipher.bx[0], cipher.bx[0], cnstZZ, q);
-@@ -449,33 +449,33 @@ void Scheme::addConstAndEqual(Ciphertext& cipher, complex<double> cnst, long log
+@@ -449,33 +461,33 @@ void Scheme::addConstAndEqual(Ciphertext& cipher, complex<double> cnst, long log
  
  //-----------------------------------------
  
@@ -442,7 +501,7 @@ index 0b1fa9a..cb6d2bc 100644
  	ZZ q = ring.qpows[cipher.logq];
  	res.copyParams(cipher);
  	ring.multByMonomial(res.ax, cipher.ax, 3 * Nh);
-@@ -492,7 +492,7 @@ void Scheme::idivAndEqual(Ciphertext& cipher) {
+@@ -492,7 +504,7 @@ void Scheme::idivAndEqual(Ciphertext& cipher) {
  	ring.multByMonomialAndEqual(cipher.bx, 3 * Nh);
  }
  
@@ -451,7 +510,7 @@ index 0b1fa9a..cb6d2bc 100644
  	res.copyParams(cipher1);
  	res.logp += cipher2.logp;
  
-@@ -546,7 +546,7 @@ void Scheme::mult(Ciphertext& res, Ciphertext& cipher1, Ciphertext& cipher2) {
+@@ -546,7 +558,7 @@ void Scheme::mult(Ciphertext& res, Ciphertext& cipher1, Ciphertext& cipher2) {
  	delete[] raa;
  }
  
@@ -460,7 +519,7 @@ index 0b1fa9a..cb6d2bc 100644
  
  	ZZ q = ring.qpows[cipher1.logq];
  	ZZ qQ = ring.qpows[cipher1.logq + logQ];
-@@ -603,7 +603,7 @@ void Scheme::multAndEqual(Ciphertext& cipher1, Ciphertext& cipher2) {
+@@ -603,7 +615,7 @@ void Scheme::multAndEqual(Ciphertext& cipher1, Ciphertext& cipher2) {
  
  //-----------------------------------------
  
@@ -469,7 +528,7 @@ index 0b1fa9a..cb6d2bc 100644
  	res.copyParams(cipher);
  	res.logp += cipher.logp;
  	ZZ q = ring.qpows[cipher.logq];
-@@ -698,7 +698,7 @@ void Scheme::squareAndEqual(Ciphertext& cipher) {
+@@ -698,7 +710,7 @@ void Scheme::squareAndEqual(Ciphertext& cipher) {
  
  //-----------------------------------------
  
@@ -478,7 +537,7 @@ index 0b1fa9a..cb6d2bc 100644
  	ZZ q = ring.qpows[cipher.logq];
  	ZZ cnstZZ = EvaluatorUtils::scaleUpToZZ(cnst, logp);
  	ring.multByConst(res.ax, cipher.ax, cnstZZ, q);
-@@ -707,7 +707,16 @@ void Scheme::multByConst(Ciphertext& res, Ciphertext& cipher, double cnst, long
+@@ -707,7 +719,16 @@ void Scheme::multByConst(Ciphertext& res, Ciphertext& cipher, double cnst, long
  	res.logp += logp;
  }
  
@@ -496,7 +555,7 @@ index 0b1fa9a..cb6d2bc 100644
  	res.copy(cipher);
  	multByConstAndEqual(res, cnst, logp);
  }
-@@ -733,7 +742,7 @@ void Scheme::multByConstAndEqual(Ciphertext& cipher, double cnst, long logp) {
+@@ -733,7 +754,7 @@ void Scheme::multByConstAndEqual(Ciphertext& cipher, double cnst, long logp) {
  	cipher.logp += logp;
  }
  
@@ -505,8 +564,166 @@ index 0b1fa9a..cb6d2bc 100644
  	ZZ q = ring.qpows[cipher.logq];
  	ZZ cnstZZ = EvaluatorUtils::scaleUpToZZ(cnst, logp);
  	ring.multByConstAndEqual(cipher.ax, cnstZZ, q);
+@@ -852,9 +873,148 @@ void Scheme::divByPo2AndEqual(Ciphertext& cipher, long bits) {
+ 	cipher.logq -= bits;
+ }
+ 
++// ****************** raw mult *****************
++// inplace-safe
++// return (b1*b2, a1*b2 + a2*b1, a1*a2)
++void Scheme::multRaw(Ciphertext& res, const Ciphertext &cipher1, const Ciphertext &cipher2){
++    if(cipher1.cx || cipher2.cx)
++        throw std::invalid_argument("cannot multiply with 3-tuple ctxt");
++    res.copyParams(cipher1);
++    res.logp += cipher2.logp;
++    if(!res.cx)
++        res.cx = new ZZ[N];
++
++    ZZ q = ring.qpows[cipher1.logq];
++
++    long np = ceil((2 + cipher1.logq + cipher2.logq + logN + 2)/(double)pbnd);
++
++    auto* ra1 = new uint64_t[np << logN];
++    auto* rb1 = new uint64_t[np << logN];
++    auto* ra2 = new uint64_t[np << logN];
++    auto* rb2 = new uint64_t[np << logN];
++
++    ring.CRT(ra1, cipher1.ax, np);
++    ring.CRT(rb1, cipher1.bx, np);
++    ring.CRT(ra2, cipher2.ax, np);
++    ring.CRT(rb2, cipher2.bx, np);
++
++    ring.multDNTT(res.cx, ra1, ra2, np, q);
++    ring.multDNTT(res.bx, rb1, rb2, np, q);
++    // karatsuba
++    ring.addNTTAndEqual(ra1, rb1, np);
++    ring.addNTTAndEqual(ra2, rb2, np);
++    ring.multDNTT(res.ax, ra1, ra2, np, q);
++    ring.subAndEqual(res.ax, res.cx, q);
++    ring.subAndEqual(res.ax, res.bx, q);
++
++    delete[] ra1;
++    delete[] ra2;
++    delete[] rb1;
++    delete[] rb2;
++}
++
++void Scheme::multRawInplace(Ciphertext& cipher1, const Ciphertext &cipher2){
++    multRaw(cipher1, cipher1, cipher2);
++}
++
++// inplace safe
++// return (b^2, 2ab, a^2)
++void Scheme::squareRaw(Ciphertext& res, const Ciphertext &cipher){
++    if(cipher.cx)
++        throw std::invalid_argument("cannot multiply with 3-tuple ctxt");
++    res.copyParams(cipher);
++    res.logp += cipher.logp;
++    if(!res.cx)
++        res.cx = new ZZ[N];
++
++    ZZ q = ring.qpows[cipher.logq];
++
++    long np = ceil((2 * cipher.logq + logN + 2)/(double)pbnd);
++
++    auto* ra = new uint64_t[np << logN];
++    auto* rb = new uint64_t[np << logN];
++
++    ring.CRT(ra, cipher.ax, np);
++    ring.CRT(rb, cipher.bx, np);
++
++    ring.squareNTT(res.cx, ra, np, q);
++    ring.squareNTT(res.bx, rb, np, q);
++    ring.multDNTT(res.ax, ra, rb, np, q);
++    ring.addAndEqual(res.ax, res.ax, q);
++
++    delete[] ra;
++    delete[] rb;
++}
++
++void Scheme::squareRawInplace(Ciphertext &res){
++    squareRaw(res, res);
++}
++
++// inplace-safe
++void Scheme::relinearize(Ciphertext &res, const Ciphertext &cipher){
++    if(!cipher.cx){
++        return;
++    }
++    res.copyParams(cipher);
++
++    Key* key = isSerialized ? SerializationUtils::readKey(serKeyMap.at(MULTIPLICATION)) : keyMap.at(MULTIPLICATION);
++
++    ZZ qQ = ring.qpows[cipher.logq + logQ];
++    ZZ q = ring.qpows[cipher.logq];
++    ZZ* as = new ZZ[N];
++    ZZ* bs = new ZZ[N];
++
++    long np = ceil((cipher.logq + logQQ + logN + 2)/(double)pbnd);
++    auto* raa = new uint64_t[np << logN];
++    ring.CRT(raa, cipher.cx, np);
++    ring.multDNTT(as, raa, key->rax, np, qQ);
++    ring.multDNTT(bs, raa, key->rbx, np, qQ);
++
++    ring.rightShiftAndEqual(as, logQ);
++    ring.rightShiftAndEqual(bs, logQ);
++
++    ring.add(res.bx, cipher.bx, bs, q);
++    ring.add(res.ax, cipher.ax, as, q);
++
++    delete[] as;
++    delete[] bs;
++    delete[] res.cx;
++    res.cx = nullptr;
++}
++
++void Scheme::relinearizeInplace(Ciphertext &cipher) {
++    relinearize(cipher, cipher);
++}
++
+ 
+ //-----------------------------------------
+ 
++void Scheme::scalingUp(Ciphertext &res, Ciphertext &cipher, long dlogp, bool modup) {
++    res.copyParams(cipher);
++    res.logp += dlogp;
++    if(modup)
++        res.logq += dlogp;
++    auto newq = ring.qpows[res.logq];
++    ring.leftShift(res.ax, cipher.ax, dlogp, newq);
++    ring.leftShift(res.bx, cipher.bx, dlogp, newq);
++    if(cipher.cx){
++        res.cx = new ZZ[N];
++        ring.leftShift(res.cx, cipher.cx, dlogp, newq);
++    }
++}
++
++void Scheme::equalize(Ciphertext &cipher1, Ciphertext &cipher2) {
++    if(cipher1.logp != cipher2.logp){
++        throw std::invalid_argument("scaling factor mismatch");
++    }
++    if(cipher1.logq > cipher2.logq){
++        modDownToAndEqual(cipher1, cipher2.logq);
++    }
++    else if(cipher1.logq < cipher2.logq){
++        modDownToAndEqual(cipher2, cipher1.logq);
++    }
++}
++
+ void Scheme::reScaleBy(Ciphertext& res, Ciphertext& cipher, long dlogq) {
+ 	res.copyParams(cipher);
+ 	ring.rightShift(res.ax, cipher.ax, dlogq);
+@@ -914,6 +1074,8 @@ void Scheme::modDownToAndEqual(Ciphertext& cipher, long logq) {
+ 	cipher.logq = logq;
+ 	ring.modAndEqual(cipher.ax, q);
+ 	ring.modAndEqual(cipher.bx, q);
++    if(cipher.cx)
++        ring.modAndEqual(cipher.cx, q);
+ }
+ 
+ 
 diff --git a/HEAAN/src/Scheme.h b/HEAAN/src/Scheme.h
-index 0c41b52..e8059d0 100644
+index 0c41b52..bfb1088 100644
 --- a/HEAAN/src/Scheme.h
 +++ b/HEAAN/src/Scheme.h
 @@ -118,51 +118,53 @@ public:
@@ -588,4 +805,35 @@ index 0c41b52..e8059d0 100644
 +	void multByConstAndEqual(Ciphertext& cipher, const NTL::RR& cnst, long logp);
  
  	void multByConstAndEqual(Ciphertext& cipher, std::complex<double> cnst, long logp);
+ 
+@@ -196,11 +198,30 @@ public:
+ 
+ 	void divByPo2AndEqual(Ciphertext& cipher, long bits);
+ 
++    // ******************* raw multiplications **********************
++
++    void multRaw(Ciphertext& res, const Ciphertext &cipher1, const Ciphertext &cipher2);
++
++    void multRawInplace(Ciphertext& cipher1, const Ciphertext &cipher2);
++
++    void squareRaw(Ciphertext& res, const Ciphertext &cipher);
++
++    void squareRawInplace(Ciphertext &res);
++
++    void relinearize(Ciphertext &res, const Ciphertext &cipher);
++
++    void relinearizeInplace(Ciphertext &cipher);
++
+ 
+ 	//----------------------------------------------------------------------------------
+ 	//   RESCALING
+ 	//----------------------------------------------------------------------------------
+ 
++    // increase the scaling factor by `dlogp` bits, optionally increase the modulus by modup bits.
++    void scalingUp(Ciphertext& res, Ciphertext& cipher, long dlogp, bool modup=false);
++
++    // bring both ciphertexts to the same modulus (their scaling factor must be the same)
++    void equalize(Ciphertext &cipher1, Ciphertext &cipher2);
+ 
+ 	void reScaleBy(Ciphertext& res, Ciphertext& cipher, long dlogq);
  

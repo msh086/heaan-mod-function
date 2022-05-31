@@ -11,6 +11,9 @@ using std::cout, std::endl, std::complex;
 
 static std::map<int, std::vector<RR>> coeff_map;
 
+long logI = 4;
+SecretKey *dbg_sk = nullptr;
+
 /**
  * is inplace safe
  * @param scheme
@@ -18,61 +21,162 @@ static std::map<int, std::vector<RR>> coeff_map;
  * @param coeffs from the lowest term to the highest term
  * @return
  */
-template<typename T>
-void homo_eval_poly(Scheme &scheme, Ciphertext &dst, const Ciphertext &ciphertext, std::vector<T> &coeffs) {
-    auto n_coeffs = coeffs.size();
-    if (n_coeffs == 0)
-        throw std::invalid_argument("the polynomial to be evaluated is empty");
-    if (n_coeffs == 1)
-        throw std::invalid_argument("the polynomial to be evaluated should not be constant");
-    auto max_deg = coeffs.size() - 1;
-    auto tower_size = NTL::NumBits(max_deg);
-    std::vector<Ciphertext> tower;
-    tower.reserve(tower_size);
-    tower.emplace_back(ciphertext);
-    auto log_factor = ciphertext.logp;
-    for (long i = 1; i < tower_size; i++) {
-        Ciphertext tmp;
-        scheme.square(tmp, tower[i - 1]);
-        scheme.reScaleByAndEqual(tmp, log_factor);
-        tower.emplace_back(tmp);
-    }
-    // c^(2^0), ..., c^(2^(tower_size - 1)) are computed
-    if (&dst != &ciphertext)
-        dst.copy(ciphertext); // NOTE: assign operator is not overload, shallow copy will cause memory problem
-    scheme.multByConstAndEqual(dst, coeffs[1], log_factor);
-    scheme.reScaleByAndEqual(dst, log_factor);
-    scheme.addConstAndEqual(dst, coeffs[0], log_factor);
-    // now dst = a_0 + a_1 * x
-    for (int deg = 2; deg < n_coeffs; deg++) {
-        unsigned int cur_deg_total_bits = NTL::NumBits(deg), cursor_bit_idx = 0;
-        for (; cursor_bit_idx < cur_deg_total_bits; cursor_bit_idx++) {
-            if ((1 << cursor_bit_idx) & deg)
-                break;
-        }
-        if (fabs(coeffs[deg]) * exp2(tower[cursor_bit_idx].logp) < 0.5) // too small s.t. encoding results is zero poly
-            continue;
-        Ciphertext tmp_ciphertext = tower[cursor_bit_idx];
-        scheme.multByConstAndEqual(tmp_ciphertext, coeffs[deg], log_factor);
-        scheme.reScaleByAndEqual(tmp_ciphertext, log_factor);
-        while (++cursor_bit_idx < cur_deg_total_bits) {
-            if ((1 << cursor_bit_idx) & deg) {
-                scheme.multAndEqual(tmp_ciphertext, tower[cursor_bit_idx]);
-                scheme.reScaleByAndEqual(tmp_ciphertext, log_factor);
-            } else {
-                scheme.multByConstAndEqual(tmp_ciphertext, 1, log_factor);
-                scheme.reScaleByAndEqual(tmp_ciphertext, log_factor);
+//template<typename T>
+//void homo_eval_poly(Scheme &scheme, Ciphertext &dst, const Ciphertext &ciphertext, std::vector<T> &coeffs) {
+//    auto n_coeffs = coeffs.size();
+//    if (n_coeffs == 0)
+//        throw std::invalid_argument("the polynomial to be evaluated is empty");
+//    if (n_coeffs == 1)
+//        throw std::invalid_argument("the polynomial to be evaluated should not be constant");
+//    auto max_deg = coeffs.size() - 1;
+//    auto tower_size = NTL::NumBits(max_deg);
+//    std::vector<Ciphertext> tower;
+//    tower.reserve(tower_size);
+//    tower.emplace_back(ciphertext);
+//    auto log_factor = ciphertext.logp;
+//    for (long i = 1; i < tower_size; i++) {
+//        Ciphertext tmp;
+//        scheme.square(tmp, tower[i - 1]);
+//        scheme.reScaleByAndEqual(tmp, log_factor);
+//        tower.emplace_back(tmp);
+//    }
+//    // c^(2^0), ..., c^(2^(tower_size - 1)) are computed
+//    if (&dst != &ciphertext)
+//        dst.copy(ciphertext); // NOTE: assign operator is not overload, shallow copy will cause memory problem
+//    scheme.multByConstAndEqual(dst, coeffs[1], log_factor);
+//    scheme.reScaleByAndEqual(dst, log_factor);
+//    scheme.addConstAndEqual(dst, coeffs[0], log_factor);
+//    // now dst = a_0 + a_1 * x
+//    for (int deg = 2; deg < n_coeffs; deg++) {
+//        unsigned int cur_deg_total_bits = NTL::NumBits(deg), cursor_bit_idx = 0;
+//        for (; cursor_bit_idx < cur_deg_total_bits; cursor_bit_idx++) {
+//            if ((1 << cursor_bit_idx) & deg)
+//                break;
+//        }
+//        if (fabs(coeffs[deg]) * exp2(tower[cursor_bit_idx].logp) < 0.5) // too small s.t. encoding results is zero poly
+//            continue;
+//        Ciphertext tmp_ciphertext = tower[cursor_bit_idx];
+//        scheme.multByConstAndEqual(tmp_ciphertext, coeffs[deg], log_factor);
+//        scheme.reScaleByAndEqual(tmp_ciphertext, log_factor);
+//        while (++cursor_bit_idx < cur_deg_total_bits) {
+//            if ((1 << cursor_bit_idx) & deg) {
+//                scheme.multAndEqual(tmp_ciphertext, tower[cursor_bit_idx]);
+//                scheme.reScaleByAndEqual(tmp_ciphertext, log_factor);
+//            } else {
+//                scheme.multByConstAndEqual(tmp_ciphertext, 1, log_factor);
+//                scheme.reScaleByAndEqual(tmp_ciphertext, log_factor);
+//            }
+//        }
+//        scheme.modDownToAndEqual(dst, tmp_ciphertext.logq);
+//        scheme.addAndEqual(dst, tmp_ciphertext);
+//    }
+//}
+
+
+//template<typename T>
+//void homo_eval_poly(Scheme &scheme, Ciphertext &dst, std::vector<T> &coeffs) {
+//    homo_eval_poly(scheme, dst, dst, coeffs);
+//}
+
+
+/**
+ *  use power of 2 giant step, since otherwise BSGS will not lead to optimal depth
+ *  the result is always unrelined and unrescaled(with a scaling factor of 2 * logp)
+ * @param scheme
+ * @param deg degree of the polynomial to be evaluated
+ * @param k log2(giant step)
+ * @param l number of levels of the inner nodes
+ * @param node_id root has id 1, the left and right children of node i has id 2*i and 2*i+1
+ * @param dst ctxt to store the result
+ * @param coeffs coefficients of the polynomial to be evaluated
+ * @param bsgs_basis a map from int to Ciphertext that stores the BSGS basis
+ */
+void homo_BSGS_recurse(Scheme &scheme, uint32_t deg, int k, int l, int node_id, Ciphertext &dst, const NTL::RR *coeffs,
+                       std::map<int, Ciphertext> &bsgs_basis) {
+    int giant_step = 1 << k;
+    auto logp = bsgs_basis[1].logp, ctxt_n = bsgs_basis[1].n;
+    if (deg < giant_step) {
+        // the leftmost leaf node at the l+1 level, and deg >= msb(giant_step) + 1
+        if (node_id == (1 << l) && k > 1 && deg >= ((giant_step >> 1) + 1)) {
+            int new_m = std::ceil(std::log2(deg + 1));
+            int new_k = new_m >> 1;
+            int new_l = new_m - new_k;
+            homo_BSGS_recurse(scheme, deg, new_k, new_l, 1, dst, coeffs, bsgs_basis);
+        } else { // recursion ends
+            dst.n = ctxt_n;
+            dst.logp = 3 * logp;
+            dst.logq = logQ; // max modulus
+            dst.free();
+            scheme.addConstAndEqual(dst, coeffs[0], 3 * logp);
+
+            Ciphertext tmp;
+            if(deg >= 1) {
+                // scaling factor = logp for i = 1
+                scheme.multByConst(tmp, bsgs_basis[1], coeffs[1], 2 * logp);
+                scheme.equalize(dst, tmp);
+                scheme.addAndEqual(dst, tmp);
             }
+            for (int i = 2; i <= deg; i++) {
+                // scaling factor = 3 * logp for i >= 2 no matter the baby step basis is relined or not
+                scheme.multByConst(tmp, bsgs_basis[i], coeffs[i], logp);
+                scheme.equalize(dst, tmp);
+                scheme.addAndEqual(dst, tmp);
+            }
+            scheme.reScaleByAndEqual(dst, logp); // scaling factor = 2 * logp
         }
-        scheme.modDownToAndEqual(dst, tmp_ciphertext.logq);
-        scheme.addAndEqual(dst, tmp_ciphertext);
+    } else { // inner node
+        Ciphertext q;
+        int split_deg = 1 << (int(std::ceil(std::log2(deg + 1))) - 1);
+        homo_BSGS_recurse(scheme, deg - split_deg, k, l, node_id << 1, q, coeffs + split_deg, bsgs_basis);
+        scheme.relinearizeInplace(q);
+        scheme.reScaleByAndEqual(q, logp);
+        scheme.multRaw(dst, q, bsgs_basis[split_deg]);
+        // r will reuse the space of q
+        if(node_id >= (1 << (l - 1)) && q.cx){ // if current node's children are leaf nodes, then they are unlikely to use cx
+            delete[] q.cx;
+            q.cx = nullptr;
+        }
+        Ciphertext &r = q;
+        homo_BSGS_recurse(scheme, split_deg - 1, k, l, (node_id << 1) + 1, r, coeffs, bsgs_basis);
+        scheme.equalize(dst, r);
+        scheme.addAndEqual(dst, r);
     }
 }
 
 
-template<typename T>
-void homo_eval_poly(Scheme &scheme, Ciphertext &dst, std::vector<T> &coeffs) {
-    homo_eval_poly(scheme, dst, dst, coeffs);
+void homo_BSGS(Scheme &scheme, Ciphertext &dst, const Ciphertext &ciphertext, const std::vector<NTL::RR> &coeffs) {
+    std::map<int, Ciphertext> bsgs_basis;
+    bsgs_basis[1].copy(ciphertext); // don't use assigning operator
+    uint32_t deg = coeffs.size() - 1;
+    // build basis
+    int m = std::ceil(std::log2(deg + 1)); // m = NumBits(deg)
+    int k = m >> 1; // giant step = 2^k
+    // levels of tree, the root node has level 1, the leaf node has level l, the degree of the splitting basis at level i is 2^(l-i)*GS
+    int l = m - k;
+    int giant_step = 1 << k;
+    auto logp = ciphertext.logp;
+    // build the basis for baby steps
+    for (int i = 2; i < giant_step; i++) {
+        if (!(i & (i - 1))) { // power of 2
+            scheme.square(bsgs_basis[i], bsgs_basis[i >> 1]); // mult and relin
+        } else {
+            int msb = 1 << (int(std::ceil(std::log2(i + 1))) - 1);
+            int rem = i - msb;
+            if (!bsgs_basis[rem].relined()) {
+                scheme.relinearizeInplace(bsgs_basis[i]);
+            }
+            scheme.multRaw(bsgs_basis[i], bsgs_basis[msb], bsgs_basis[rem]);
+        }
+    }
+    // build the basis for giant steps
+    for (int i = giant_step; i <= deg; i++) {
+        scheme.square(bsgs_basis[i], bsgs_basis[i >> 1]);
+        scheme.reScaleByAndEqual(bsgs_basis[i], logp);
+    }
+    // start recursion
+    homo_BSGS_recurse(scheme, deg, k, l, 1, dst, coeffs.data(), bsgs_basis);
+    scheme.relinearizeInplace(dst);
+    scheme.reScaleByAndEqual(dst, logp);
 }
 
 
@@ -83,7 +187,7 @@ void homo_eval_poly(Scheme &scheme, Ciphertext &dst, std::vector<T> &coeffs) {
 void homo_eval_sign(Scheme &scheme, Ciphertext &dst, const Ciphertext &ciphertext, int n_iter, int deg) {
     auto &coeffs = coeff_map.at(deg);
     for (int i = 0; i <= n_iter; i++)
-        homo_eval_poly(scheme, dst, ciphertext, coeffs);
+        homo_BSGS(scheme, dst, ciphertext, coeffs);
 }
 
 
@@ -254,7 +358,7 @@ plain_eval_mod(complex<double> *dst, const complex<double> *src, int len, int n_
 
 
 void
-evalExpAndEqualNew(Scheme &scheme, Ring &ring, Ciphertext &cipher, long logT, long logI, int n_iter, int K, int deg) {
+evalExpAndEqualNew(Scheme &scheme, Ring &ring, Ciphertext &cipher, long logT, int n_iter, int K, int deg) {
     long slots = cipher.n;
     long logSlots = log2(slots);
     BootContext *bootContext = ring.bootContextMap.at(logSlots);
@@ -319,7 +423,7 @@ void test_precise_mod(Scheme &scheme, SecretKey &secretKey, long logp, long logq
                       int n_iter_mod_inner, int n_iter_mod_outer, int n_iter_sign,
                       int deg_mod_inner, int deg_mod_outer, int deg_sign, bool precise = false,
                       int repeat = 1, const std::string &filename = "") {
-    long slots = (1 << logSlots);
+    int slots = (1 << logSlots);
     std::vector<complex<double>> mod_input(slots);
     std::vector<complex<double>> expected(slots);
 
@@ -402,13 +506,13 @@ void testBootstrap(SecretKey &secretKey, Scheme &scheme, Ring &ring,
     Plaintext bounded_ptxt(logp, logq, slots);
     // freshly encoded ptxt will have scaling factor of logp + logQ, where the logQ bits are removed during encryption
     NTL::ZZ range = to_ZZ(to_RR(ZZ(1) << logq) * eps);
-    for (int i = 0; i < N; i += Nh / slots) { // follow the encoding rule in heaan
+    for (long i = 0; i < N; i += Nh / slots) { // follow the encoding rule in heaan
         bounded_ptxt.mx[i] = (NTL::RandomBnd(range * 2) - range) << logQ;
     }
     Ciphertext cipher;
     scheme.encryptMsg(cipher, bounded_ptxt);
     Plaintext actual_ptxt(logp, logq, slots);
-    for (int i = 0; i < N; i += Nh / slots)
+    for (long i = 0; i < N; i += Nh / slots)
         actual_ptxt.mx[i] = bounded_ptxt.mx[i] >> logQ;
     auto mvec = scheme.decode(actual_ptxt);
 
@@ -445,10 +549,10 @@ void testBootstrap(SecretKey &secretKey, Scheme &scheme, Ring &ring,
 #define DBG_MOD
 #ifdef DBG_MOD
     Ciphertext mod_boot_out_real(cipher);
-    evalExpAndEqualNew(scheme, ring, mod_boot_out_real, logT, 4, n_iter, K, deg);
+    evalExpAndEqualNew(scheme, ring, mod_boot_out_real, logT, n_iter, K, deg);
     printf("after mod new: logp = %ld, logq = %ld\n", mod_boot_out_real.logp, mod_boot_out_real.logq);
 #endif
-    scheme.evalExpAndEqual(cipher, logT); // TODO update to RR too
+    scheme.evalExpAndEqual(cipher, logT);
 
     // FIXME: debug
     printf("after mod: logp = %ld, logq = %ld\n", cipher.logp, cipher.logq);
@@ -701,7 +805,7 @@ int main() {
             fprintf(stderr, "size mismatch\n");
             return 1;
         }
-        int len = RR_vec.size();
+        auto len = RR_vec.size();
         for (int i = 0; i < len; i++) {
             if (fabs(to_double(RR_vec[i]) - double_vec[i]) > 0.1) {
                 fprintf(stderr, "coeffs mismatch: RR=%f double=%f\n", to_double(RR_vec[i]), double_vec[i]);
@@ -721,14 +825,6 @@ int main() {
     long logn = 3; ///< number of slot is 1024 (this value should be < logN in "src/Params.h")
 
     long logT = 4;
-    /**
-     * 	long logq = 800; ///< Ciphertext Modulus
-	 *  long logp = 30; ///< Real message will be quantized by multiplying 2^40
-	 *  long logn = 4; ///< log2(The number of slots)
-     */
-//    logq = 800;
-    logp = 30;
-    logn = 3;
 
     bool enable_boot = true;
 
@@ -738,8 +834,10 @@ int main() {
     SecretKey secretKey(ring);
     Scheme scheme(secretKey, ring);
 
+    dbg_sk = &secretKey;
+
     if (enable_boot) {
-        scheme.addBootKey(secretKey, logn, logq + 4);
+        scheme.addBootKey(secretKey, logn, logq + logI);
     }
 //    testBootstrap(secretKey, scheme, ring,
 //                  logq, logp, logn, logT,
@@ -748,51 +846,60 @@ int main() {
 //    return 0;
 
     // FIXME: debug
-    /* int slots = 1 << logn;
-    int K = 16;
-    double radius = pow(2, -4);
-    Ciphertext ctxt;
-    std::vector<complex<double>> test_vec(slots);
-    for (int i = 0; i < slots; i++) {
-        // sample double in (-radius, radius)
-        auto rand_l = NTL::RandomBits_ulong(64);
-        double bias = long(rand_l) / std::pow(2.0, 63) * radius;
-        // sample nK in [-K, K]
-        double real_val = bias;
-        test_vec[i].real(real_val);
-    }
-    scheme.encrypt(ctxt, test_vec.data(), slots, logp, logq);
-    scheme.squareAndEqual(ctxt);
-    scheme.reScaleByAndEqual(ctxt, logp);
-    auto dec_vec = scheme.decrypt(secretKey, ctxt);
-    //FILE* f = fopen("error test", "w");
-    // for(int i = 0; i < slots; i++){
-        // fprintf(f, "%f -> (%f, %f), diff in real = %f\n",
-            // test_vec[i].real(), dec_vec[i].real(), dec_vec[i].imag(), dec_vec[i].real() - test_vec[i].real() * test_vec[i].real());
-    // }
-    double mean = 0;
-    for(int i = 0; i < slots; i++)
-        mean += std::abs(dec_vec[i].real() - test_vec[i].real() * test_vec[i].real());
-    mean /= slots;
-    cout << "mean = " << mean << '\n';
-    //fclose(f); */
-    //return 0; // FIXME: finish debug
+//    logq = logQ;
+//    logp = 40;
+//    int slots = 1 << logNh;
+//    double radius = 1;
+//    Ciphertext ctxt;
+//    std::vector<complex<double>> test_vec(slots);
+//    for (int i = 0; i < slots; i++) {
+//        // sample double in (-radius, radius)
+//        auto rand_l = NTL::RandomBits_ulong(64);
+//        double bias = long(rand_l) / std::pow(2.0, 63) * radius;
+//        double real_val = bias;
+//        test_vec[i].real(real_val);
+//    }
+//    std::vector<RR> test_coeffs = {RR(1), RR(2), RR(3), RR(4), RR(5)}; // x^3 + 2x + 1
+//    std::vector<complex<double>> expected(slots);
+//    plain_eval_poly(expected.data(), test_vec.data(), slots, test_coeffs);
+//    // homo part
+//    scheme.encrypt(ctxt, test_vec.data(), slots, logp, logq);
+//
+//    Ciphertext result;
+//    homo_BSGS(scheme, result, ctxt, test_coeffs);
+////    scheme.squareRaw(result, ctxt);
+////    scheme.relinearize(ctxt, result);
+//
+//    auto dec_vec = scheme.decrypt(secretKey, result);
+//    FILE *f = fopen("error test", "w");
+//    for (int i = 0; i < slots; i++) {
+//        fprintf(f, "%f -> (%f, %f), diff in real = %f\n",
+//                test_vec[i].real(), dec_vec[i].real(), dec_vec[i].imag(), dec_vec[i].real() - expected[i].real());
+//    }
+//    double mean = 0;
+//    for (int i = 0; i < slots; i++)
+//        mean += std::abs(dec_vec[i].real() - expected[i].real());
+//    mean /= slots;
+//    cout << "mean = " << mean << '\n';
+//    fclose(f);
+//    return 0;
+    // FIXME: finish debug
 
 
     std::vector<std::thread> threads;
 
     TestModParams testModParams[] = {
-            {
-                    30, logQ, 4,
-                    1, 3, 3, 31, 31, 31,
-                    8, 1, RR(pow(2.0, -4)), RR(0.5), "pm_test", false
-            }
+//            {
+//                    30, logQ, 4,
+//                    1, 3, 3, 31, 31, 31,
+//                    8, 1, RR(pow(2.0, -4)), RR(0.5), "pm_test", false
+//            }
     };
 
     TestBootParams testBootParams[] = {
-//            {
-//                    3, 8, 31, 1, RR(pow(2.0, -4)), RR(pow(2.0, -7)), "2_12_31_-4_-7_RR"
-//            },
+            {
+                    3, 8, 31, 1, RR(pow(2.0, -4)), RR(pow(2.0, -7)), "2_12_31_-4_-7_RR"
+            },
 //           {
 //                   3, 8, 31, 1, RR(pow(2.0, -4)), RR(pow(2.0, -10)), true, "2_12_31_-4_-10"
 //           },
