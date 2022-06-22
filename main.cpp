@@ -18,6 +18,7 @@ static std::atomic<int> alive_threads = 0;
 long logI = 4;
 SecretKey *dbg_sk = nullptr;
 
+static Ciphertext tmp_ctxt0, tmp_ctxt1;
 /**
  * is inplace safe
  * @param scheme
@@ -82,7 +83,13 @@ SecretKey *dbg_sk = nullptr;
 //    homo_eval_poly(scheme, dst, dst, coeffs);
 //}
 
+// 0 = lazy relin + lazy rescale; 1 = 0 + exploit extra level at leaf; 2 = 0 + exploit extra level "one lvl per node"
+int bsgs_mode = 0;
 
+/*
+ * In essence, the mismatch in noise budget comes from the unbalanced property of the binary tree
+ * i.e. the right sibling always gets an extra level
+ * */
 /**
  *  use power of 2 giant step, since otherwise BSGS will not lead to optimal depth
  *  the result is always unrelined and unrescaled(with a scaling factor of 2 * logp)
@@ -90,98 +97,172 @@ SecretKey *dbg_sk = nullptr;
  * @param deg degree of the polynomial to be evaluated
  * @param k log2(giant step)
  * @param l number of levels of the inner nodes
+ * //TODO: `spare` and `node_id` can be transformed, which one should we keep?
  * @param node_id root has id 1, the left and right children of node i has id 2*i and 2*i+1
+ * @param spare number of spared levels
  * @param dst ctxt to store the result
  * @param coeffs coefficients of the polynomial to be evaluated
- * @param bsgs_basis a map from int to Ciphertext that stores the BSGS basis
+ * //TODO: for left branch optimization, consider it later... since for now we always make full use of depth
+ * @param unbalanced whether the binary tree is unbalanced(whether the depth(and spare) of left branch needs to be checked)
+ * @param bsgs_basis a map from int to Ciphertext that stores unrelined the BSGS basis
+ * @param relined_basis a map from int to Ciphertext that stores relined BSGS basis
  */
-void homo_BSGS_recurse(Scheme &scheme, uint32_t deg, int k, int l, int node_id, Ciphertext &dst, const NTL::RR *coeffs,
-                       std::map<int, Ciphertext> &bsgs_basis) {
+void homo_BSGS_recurse(Scheme &scheme, uint32_t deg, int k, int l, int node_id, int spare,
+                       Ciphertext &dst, const NTL::RR *coeffs, bool unbalanced,
+                       std::map<int, Ciphertext> &bsgs_basis, std::map<int, Ciphertext> &relined_basis) {
     int giant_step = 1 << k;
     auto logp = bsgs_basis[1].logp, ctxt_n = bsgs_basis[1].n;
     if (deg < giant_step) {
         // the leftmost leaf node at the l+1 level, and deg >= msb(giant_step) + 1
-        if (node_id == (1 << l) && k > 1 && deg >= ((giant_step >> 1) + 1)) {
+        if (spare < 0 && k > 1 && deg >= ((giant_step >> 1) + 1)) { // spare < 0 <=> node_id == (1 << l)
             int new_m = std::ceil(std::log2(deg + 1));
             int new_k = new_m >> 1;
             int new_l = new_m - new_k;
-            homo_BSGS_recurse(scheme, deg, new_k, new_l, 1, dst, coeffs, bsgs_basis);
+            homo_BSGS_recurse(scheme, deg, new_k, new_l, 1, -1, dst, coeffs, true,
+                              bsgs_basis, relined_basis);
         } else { // recursion ends
+            // NOTE: scale ctxts up to the same logp and logq
             dst.n = ctxt_n;
-            dst.logp = 3 * logp;
-            dst.logq = logQ; // max modulus
+            dst.dropCX();
             dst.free();
-            scheme.addConstAndEqual(dst, coeffs[0], 3 * logp);
-
-            Ciphertext tmp;
-            if (deg >= 1) {
-                // scaling factor = logp for i = 1
-                scheme.multByConst(tmp, bsgs_basis[1], coeffs[1], 2 * logp);
-                scheme.equalize(dst, tmp);
-                scheme.addAndEqual(dst, tmp);
+            if(spare < 0)
+                spare = k - 1 - std::ceil(std::log2(deg));
+            if (deg == 0) {
+                dst.logp = logp + spare * logp;
+                dst.logq = logQ;
+                scheme.addConstAndEqual(dst, coeffs[0], dst.logp);
+            } else {
+                long min_cap = logQ, max_scale = 0;
+                for (int i = 1; i <= deg; i++) {
+                    min_cap = std::min(min_cap, bsgs_basis[i].logq - bsgs_basis[i].logp);
+                    max_scale = std::max(max_scale, bsgs_basis[i].logp);
+                }
+                dst.logp = max_scale + spare * logp;
+                dst.logq = min_cap + dst.logp;
+                for (int i = 1; i <= deg; i++) {
+                    if (bsgs_basis[i].logp < dst.logp) {
+                        // NOTE: use the mismatched bits (and extra levels) in logp to scale up coeffs
+                        scheme.multByConst(tmp_ctxt0, bsgs_basis[i], coeffs[i],
+                                           dst.logp - bsgs_basis[i].logp + logp);
+                        if (tmp_ctxt0.logq > dst.logq) // extra cap
+                            scheme.modDownToAndEqual(tmp_ctxt0, dst.logq);
+                        scheme.addAndEqual(dst, tmp_ctxt0);
+                    } else if (bsgs_basis[i].logq > dst.logq) {
+                        scheme.modDownToAndEqual(tmp_ctxt0, dst.logq);
+                        scheme.multByConstAndEqual(tmp_ctxt0, coeffs[i], logp + spare * logp);
+                        scheme.addAndEqual(dst, tmp_ctxt0);
+                    } else{
+                        scheme.addAndEqual(dst, bsgs_basis[i]);
+                    }
+                }
+                scheme.addConstAndEqual(dst, coeffs[0], dst.logp);
             }
-            for (int i = 2; i <= deg; i++) {
-                // scaling factor = 3 * logp for i >= 2 no matter the baby step basis is relined or not
-                scheme.multByConst(tmp, bsgs_basis[i], coeffs[i], logp);
-                scheme.equalize(dst, tmp);
-                scheme.addAndEqual(dst, tmp);
-            }
-            scheme.reScaleByAndEqual(dst, logp); // scaling factor = 2 * logp
+//            dst.n = ctxt_n;
+//            dst.logp = 3 * logp;
+//            dst.logq = logQ; // max modulus
+//            dst.free();
+//            scheme.addConstAndEqual(dst, coeffs[0], 3 * logp);
+//
+//            Ciphertext tmp;
+//            if (deg >= 1) {
+//                // scaling factor = logp for i = 1
+//                scheme.multByConst(tmp, bsgs_basis[1], coeffs[1], 2 * logp);
+//                scheme.equalize(dst, tmp);
+//                scheme.addAndEqual(dst, tmp);
+//            }
+//            for (int i = 2; i <= deg; i++) {
+//                // scaling factor = 3 * logp for i >= 2 no matter the baby step basis is relined or not
+//                scheme.multByConst(tmp, bsgs_basis[i], coeffs[i], logp);
+//                scheme.equalize(dst, tmp);
+//                scheme.addAndEqual(dst, tmp);
+//            }
+//            scheme.reScaleByAndEqual(dst, logp); // scaling factor = 2 * logp
         }
     } else { // inner node
         Ciphertext q;
         int split_deg = 1 << (int(std::ceil(std::log2(deg + 1))) - 1);
-        homo_BSGS_recurse(scheme, deg - split_deg, k, l, node_id << 1, q, coeffs + split_deg, bsgs_basis);
+        homo_BSGS_recurse(scheme, deg - split_deg, k, l, node_id << 1, spare, q, coeffs + split_deg,
+                          unbalanced, bsgs_basis, relined_basis);
         scheme.relinearizeInplace(q);
-        scheme.reScaleByAndEqual(q, logp);
-        scheme.multRaw(dst, q, bsgs_basis[split_deg]);
+        // NOTE
+        scheme.matchScalingFactor(tmp_ctxt0, tmp_ctxt1, q, relined_basis[split_deg], logp);
+        scheme.multRaw(dst, tmp_ctxt0, tmp_ctxt1);
+//        scheme.reScaleByAndEqual(q, logp);
+//        scheme.multRaw(dst, q, bsgs_basis[split_deg]);
         // r will reuse the space of q
-        if (node_id >= (1 << (l - 1)) &&
-            q.cx) { // if current node's children are leaf nodes, then they are unlikely to use cx
-            delete[] q.cx;
-            q.cx = nullptr;
-        }
-        Ciphertext &r = q;
-        homo_BSGS_recurse(scheme, split_deg - 1, k, l, (node_id << 1) + 1, r, coeffs, bsgs_basis);
-        scheme.equalize(dst, r);
+        Ciphertext &r = q; // reuse q's memory
+        homo_BSGS_recurse(scheme, split_deg - 1, k, l, (node_id << 1) + 1, spare + 1, r, coeffs,
+                          false, bsgs_basis, relined_basis);
+        // NOTE
+        if(dst.logp < r.logp)
+            scheme.scalingUp(dst, dst, r.logp - dst.logp, true);
+        else if(dst.logp > r.logp)
+            scheme.scalingUp(r, r, dst.logp - r.logp, true);
+        if(dst.logq > r.logq)
+            scheme.modDownToAndEqual(dst, r.logq);
+        else
+            scheme.modDownToAndEqual(r, dst.logq);
         scheme.addAndEqual(dst, r);
+//        scheme.equalize(dst, r);
+//        scheme.addAndEqual(dst, r);
     }
 }
 
 
 void homo_BSGS(Scheme &scheme, Ciphertext &dst, const Ciphertext &ciphertext, const std::vector<NTL::RR> &coeffs) {
     std::map<int, Ciphertext> bsgs_basis;
+    std::map<int, Ciphertext> relined_basis;
     bsgs_basis[1].copy(ciphertext); // don't use assigning operator
+    relined_basis[1].copy(ciphertext); // NOTE
     uint32_t deg = coeffs.size() - 1;
     // build basis
     int m = std::ceil(std::log2(deg + 1)); // m = NumBits(deg)
     int k = m >> 1; // giant step = 2^k
-    // levels of tree, the root node has level 1, the leaf node has level l, the degree of the splitting basis at level i is 2^(l-i)*GS
+    // levels of inner node, the root node has level 1, the leaf node has level l+1,
+    // the degree of the splitting basis at level i is 2^(l-i)*GS
     int l = m - k;
     int giant_step = 1 << k;
     auto logp = ciphertext.logp;
-    // build the basis for baby steps
+    // build the basis for baby steps, record their unrelined and relined versions
     for (int i = 2; i < giant_step; i++) {
         if (!(i & (i - 1))) { // power of 2
-            scheme.square(bsgs_basis[i], bsgs_basis[i >> 1]); // mult and relin
+            // NOTE
+            // TODO: use mismatched bits
+            scheme.matchScalingFactor(tmp_ctxt0, tmp_ctxt1, relined_basis[i >> 1], relined_basis[i >> 1], logp);
+            scheme.multRaw(bsgs_basis[i], tmp_ctxt0, tmp_ctxt1);
+            scheme.relinearize(relined_basis[i], bsgs_basis[i]);
+//            scheme.square(bsgs_basis[i], bsgs_basis[i >> 1]); // mult and relin
         } else {
             int msb = 1 << (int(std::ceil(std::log2(i + 1))) - 1);
             int rem = i - msb;
-            if (!bsgs_basis[rem].relined()) {
-                scheme.relinearizeInplace(bsgs_basis[i]);
+            // NOTE
+            if (!relined_basis.count(rem)) {
+                scheme.relinearize(relined_basis[rem], bsgs_basis[rem]);
             }
-            scheme.multRaw(bsgs_basis[i], bsgs_basis[msb], bsgs_basis[rem]);
+//            if (!bsgs_basis[rem].relined()) {
+//                scheme.relinearizeInplace(bsgs_basis[rem]);
+            // NOTE
+            // TODO: use mismatched bits
+            scheme.matchScalingFactor(tmp_ctxt0, tmp_ctxt1, relined_basis[msb], relined_basis[rem], logp);
+            scheme.multRaw(bsgs_basis[i], tmp_ctxt0, tmp_ctxt1);
+//            scheme.multRaw(bsgs_basis[i], bsgs_basis[msb], bsgs_basis[rem]);
         }
     }
-    // build the basis for giant steps
+    // build the basis for giant steps, record only their relined version
     for (int i = giant_step; i <= deg; i++) {
-        scheme.square(bsgs_basis[i], bsgs_basis[i >> 1]);
-        scheme.reScaleByAndEqual(bsgs_basis[i], logp);
+        // NOTE
+        // TODO: use mismatched bits
+        // power of 2 bases are always relined
+        scheme.matchScalingFactor(tmp_ctxt0, tmp_ctxt1, relined_basis[i >> 1], relined_basis[i >> 1], logp);
+        scheme.mult(relined_basis[i], tmp_ctxt0, tmp_ctxt1);
+//        scheme.square(bsgs_basis[i], bsgs_basis[i >> 1]);
+//        scheme.reScaleByAndEqual(bsgs_basis[i], logp);
     }
     // start recursion
-    homo_BSGS_recurse(scheme, deg, k, l, 1, dst, coeffs.data(), bsgs_basis);
+    homo_BSGS_recurse(scheme, deg, k, l, 1, -1, dst, coeffs.data(), true, bsgs_basis, relined_basis);
     scheme.relinearizeInplace(dst);
-    scheme.reScaleByAndEqual(dst, logp);
+    // NOTE
+//    scheme.reScaleByAndEqual(dst, logp);
 }
 
 
@@ -456,6 +537,12 @@ evalExpAndEqualNew(Scheme &scheme, Ring &ring, Ciphertext &cipher, long logT, in
 }
 
 
+double sample_pm1(){
+    auto rand_l = NTL::RandomBits_ulong(64);
+    return long(rand_l) / std::pow(2.0, 63);
+}
+
+
 // sample uniformly from Union_i={-K, -K+1,..., K}(i*modulus + (-radius, radius))
 void sample_mod(std::vector<complex<double>> &mod_input, std::vector<complex<double>> &expected,
                 long nSlots, int K, const RR &modulus, const RR &eps) {
@@ -477,6 +564,11 @@ void sample_mod(std::vector<complex<double>> &mod_input, std::vector<complex<dou
             expected_rem += to_double(modulus);
         expected[i].real(expected_rem);
     }
+}
+
+
+void test_BSGS(){
+
 }
 
 
@@ -593,7 +685,7 @@ void testBootstrap(SecretKey &secretKey, Scheme &scheme, Ring &ring,
         scheme.modDownToAndEqual(cipher, logq);
         scheme.normalizeAndEqual(cipher);
         cipher.logq = logQ;
-        cipher.logp = logq + 4;
+        cipher.logp = logq + 4; // NOTE: because input of mod function is (-16q, 16q)?
         Ciphertext rot;
         for (long i = logSlots; i < logNh; ++i) {
             scheme.leftRotateFast(rot, cipher, (1 << i));
