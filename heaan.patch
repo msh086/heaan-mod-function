@@ -12,10 +12,10 @@ index da56a12..ac4eade 100644
  	@echo ' '
  
 diff --git a/HEAAN/src/Ciphertext.cpp b/HEAAN/src/Ciphertext.cpp
-index 14a1a32..89c1cb4 100644
+index 14a1a32..d95f70a 100644
 --- a/HEAAN/src/Ciphertext.cpp
 +++ b/HEAAN/src/Ciphertext.cpp
-@@ -24,13 +24,13 @@ Ciphertext::Ciphertext(const Ciphertext& o) : logp(o.logp), logq(o.logq), n(o.n)
+@@ -24,18 +24,38 @@ Ciphertext::Ciphertext(const Ciphertext& o) : logp(o.logp), logq(o.logq), n(o.n)
  	}
  }
  
@@ -29,9 +29,38 @@ index 14a1a32..89c1cb4 100644
 -void Ciphertext::copy(Ciphertext& o) {
 +void Ciphertext::copy(const Ciphertext& o) {
  	copyParams(o);
- 	for (long i = 0; i < N; ++i) {
- 		ax[i] = o.ax[i];
-@@ -43,11 +43,20 @@ void Ciphertext::free() {
+-	for (long i = 0; i < N; ++i) {
+-		ax[i] = o.ax[i];
+-		bx[i] = o.bx[i];
+-	}
++    if(o.cx) {
++        addCX();
++        for (long i = 0; i < N; ++i) {
++            ax[i] = o.ax[i];
++            bx[i] = o.bx[i];
++            cx[i] = o.cx[i];
++        }
++    }else{
++        dropCX();
++        for (long i = 0; i < N; ++i) {
++            ax[i] = o.ax[i];
++            bx[i] = o.bx[i];
++        }
++    }
++}
++
++void Ciphertext::addCX() {
++    if(!cx)
++        cx = new ZZ[N];
++}
++
++void Ciphertext::dropCX() {
++    delete[] cx;
++    cx = nullptr;
+ }
+ 
+ void Ciphertext::free() {
+@@ -43,11 +63,20 @@ void Ciphertext::free() {
  		clear(ax[i]);
  		clear(bx[i]);
  	}
@@ -53,7 +82,7 @@ index 14a1a32..89c1cb4 100644
  
  }  // namespace heaan
 diff --git a/HEAAN/src/Ciphertext.h b/HEAAN/src/Ciphertext.h
-index bd7fc78..61dce16 100644
+index bd7fc78..ab35b18 100644
 --- a/HEAAN/src/Ciphertext.h
 +++ b/HEAAN/src/Ciphertext.h
 @@ -20,6 +20,7 @@ public:
@@ -64,7 +93,7 @@ index bd7fc78..61dce16 100644
  
  	long logp;
  	long logq;
-@@ -30,12 +31,14 @@ public:
+@@ -30,12 +31,18 @@ public:
  
  	Ciphertext(const Ciphertext& o);
  
@@ -73,6 +102,10 @@ index bd7fc78..61dce16 100644
  
 -	void copy(Ciphertext& o);
 +	void copy(const Ciphertext& o);
++
++    void addCX();
++
++    void dropCX();
  
  	void free();
  
@@ -378,7 +411,7 @@ index b2aa285..d74eaff 100644
  	void encode(NTL::ZZ* mx, double* vals, long slots, long logp);
  
 diff --git a/HEAAN/src/Scheme.cpp b/HEAAN/src/Scheme.cpp
-index 0b1fa9a..1e4f098 100644
+index 0b1fa9a..77392a6 100644
 --- a/HEAAN/src/Scheme.cpp
 +++ b/HEAAN/src/Scheme.cpp
 @@ -208,7 +208,7 @@ void Scheme::encode(Plaintext& plain, complex<double>* vals, long n, long logp,
@@ -399,7 +432,7 @@ index 0b1fa9a..1e4f098 100644
  	res.copyParams(cipher);
  	ring.negate(res.ax, cipher.ax);
  	ring.negate(res.bx, cipher.bx);
-@@ -391,36 +391,48 @@ void Scheme::negateAndEqual(Ciphertext& cipher) {
+@@ -391,36 +391,50 @@ void Scheme::negateAndEqual(Ciphertext& cipher) {
  	ring.negateAndEqual(cipher.bx);
  }
  
@@ -409,23 +442,27 @@ index 0b1fa9a..1e4f098 100644
  	res.copyParams(cipher1);
  	ring.add(res.ax, cipher1.ax, cipher2.ax, q);
  	ring.add(res.bx, cipher1.bx, cipher2.bx, q);
+-}
+-
+-void Scheme::addAndEqual(Ciphertext& cipher1, Ciphertext& cipher2) {
 +    if(cipher2.cx || cipher1.cx){
-+        res.cx = new ZZ[N];
++        res.addCX();
 +        ZZ* src1 = cipher1.cx ? cipher1.cx : res.cx;
 +        ZZ* src2 = cipher2.cx ? cipher2.cx : res.cx;
 +        ring.add(res.cx, src1, src2, q);
 +    }
- }
- 
--void Scheme::addAndEqual(Ciphertext& cipher1, Ciphertext& cipher2) {
++    else
++        res.dropCX();
++}
++
 +void Scheme::addAndEqual(Ciphertext& cipher1, const Ciphertext &cipher2) {
++    if(cipher1.logp != cipher2.logp || cipher1.logq != cipher2.logq)
++        throw std::invalid_argument("params mismatch");
  	ZZ q = ring.qpows[cipher1.logq];
  	ring.addAndEqual(cipher1.ax, cipher2.ax, q);
  	ring.addAndEqual(cipher1.bx, cipher2.bx, q);
 +    if(cipher2.cx){
-+        if(!cipher1.cx){
-+            cipher1.cx = new ZZ[N];
-+        }
++        cipher1.addCX();
 +        ring.addAndEqual(cipher1.cx, cipher2.cx, q);
 +    }
  }
@@ -453,16 +490,18 @@ index 0b1fa9a..1e4f098 100644
  	ZZ q = ring.qpows[cipher.logq];
  	ZZ cnstZZ = logp < 0 ? EvaluatorUtils::scaleUpToZZ(cnst.real(), cipher.logp) : EvaluatorUtils::scaleUpToZZ(cnst.real(), logp);
  	res.copy(cipher);
-@@ -433,7 +445,7 @@ void Scheme::addConstAndEqual(Ciphertext& cipher, double cnst, long logp) {
+@@ -433,7 +447,9 @@ void Scheme::addConstAndEqual(Ciphertext& cipher, double cnst, long logp) {
  	AddMod(cipher.bx[0], cipher.bx[0], cnstZZ, q);
  }
  
 -void Scheme::addConstAndEqual(Ciphertext& cipher, RR& cnst, long logp) {
 +void Scheme::addConstAndEqual(Ciphertext& cipher, const RR &cnst, long logp) {
++    if(cipher.logp != logp)
++        throw std::invalid_argument("params mismatch");
  	ZZ q = ring.qpows[cipher.logq];
  	ZZ cnstZZ = logp < 0 ? EvaluatorUtils::scaleUpToZZ(cnst, cipher.logp) : EvaluatorUtils::scaleUpToZZ(cnst, logp);
  	AddMod(cipher.bx[0], cipher.bx[0], cnstZZ, q);
-@@ -449,33 +461,33 @@ void Scheme::addConstAndEqual(Ciphertext& cipher, complex<double> cnst, long log
+@@ -449,33 +465,33 @@ void Scheme::addConstAndEqual(Ciphertext& cipher, complex<double> cnst, long log
  
  //-----------------------------------------
  
@@ -501,7 +540,7 @@ index 0b1fa9a..1e4f098 100644
  	ZZ q = ring.qpows[cipher.logq];
  	res.copyParams(cipher);
  	ring.multByMonomial(res.ax, cipher.ax, 3 * Nh);
-@@ -492,7 +504,7 @@ void Scheme::idivAndEqual(Ciphertext& cipher) {
+@@ -492,7 +508,7 @@ void Scheme::idivAndEqual(Ciphertext& cipher) {
  	ring.multByMonomialAndEqual(cipher.bx, 3 * Nh);
  }
  
@@ -510,7 +549,7 @@ index 0b1fa9a..1e4f098 100644
  	res.copyParams(cipher1);
  	res.logp += cipher2.logp;
  
-@@ -546,7 +558,7 @@ void Scheme::mult(Ciphertext& res, Ciphertext& cipher1, Ciphertext& cipher2) {
+@@ -546,7 +562,7 @@ void Scheme::mult(Ciphertext& res, Ciphertext& cipher1, Ciphertext& cipher2) {
  	delete[] raa;
  }
  
@@ -519,7 +558,7 @@ index 0b1fa9a..1e4f098 100644
  
  	ZZ q = ring.qpows[cipher1.logq];
  	ZZ qQ = ring.qpows[cipher1.logq + logQ];
-@@ -603,7 +615,7 @@ void Scheme::multAndEqual(Ciphertext& cipher1, Ciphertext& cipher2) {
+@@ -603,7 +619,7 @@ void Scheme::multAndEqual(Ciphertext& cipher1, Ciphertext& cipher2) {
  
  //-----------------------------------------
  
@@ -528,7 +567,7 @@ index 0b1fa9a..1e4f098 100644
  	res.copyParams(cipher);
  	res.logp += cipher.logp;
  	ZZ q = ring.qpows[cipher.logq];
-@@ -698,7 +710,7 @@ void Scheme::squareAndEqual(Ciphertext& cipher) {
+@@ -698,7 +714,7 @@ void Scheme::squareAndEqual(Ciphertext& cipher) {
  
  //-----------------------------------------
  
@@ -537,7 +576,7 @@ index 0b1fa9a..1e4f098 100644
  	ZZ q = ring.qpows[cipher.logq];
  	ZZ cnstZZ = EvaluatorUtils::scaleUpToZZ(cnst, logp);
  	ring.multByConst(res.ax, cipher.ax, cnstZZ, q);
-@@ -707,7 +719,16 @@ void Scheme::multByConst(Ciphertext& res, Ciphertext& cipher, double cnst, long
+@@ -707,7 +723,22 @@ void Scheme::multByConst(Ciphertext& res, Ciphertext& cipher, double cnst, long
  	res.logp += logp;
  }
  
@@ -547,6 +586,12 @@ index 0b1fa9a..1e4f098 100644
 +    ZZ cnstZZ = EvaluatorUtils::scaleUpToZZ(cnst, logp);
 +    ring.multByConst(res.ax, cipher.ax, cnstZZ, q);
 +    ring.multByConst(res.bx, cipher.bx, cnstZZ, q);
++    if(cipher.cx){
++        res.addCX();
++        ring.multByConst(res.cx, cipher.cx, cnstZZ, q);
++    }
++    else
++        res.dropCX();
 +    res.copyParams(cipher);
 +    res.logp += logp;
 +}
@@ -555,7 +600,7 @@ index 0b1fa9a..1e4f098 100644
  	res.copy(cipher);
  	multByConstAndEqual(res, cnst, logp);
  }
-@@ -733,7 +754,7 @@ void Scheme::multByConstAndEqual(Ciphertext& cipher, double cnst, long logp) {
+@@ -733,11 +764,13 @@ void Scheme::multByConstAndEqual(Ciphertext& cipher, double cnst, long logp) {
  	cipher.logp += logp;
  }
  
@@ -564,22 +609,60 @@ index 0b1fa9a..1e4f098 100644
  	ZZ q = ring.qpows[cipher.logq];
  	ZZ cnstZZ = EvaluatorUtils::scaleUpToZZ(cnst, logp);
  	ring.multByConstAndEqual(cipher.ax, cnstZZ, q);
-@@ -852,9 +873,148 @@ void Scheme::divByPo2AndEqual(Ciphertext& cipher, long bits) {
+ 	ring.multByConstAndEqual(cipher.bx, cnstZZ, q);
++    if(cipher.cx)
++        ring.multByConstAndEqual(cipher.cx, cnstZZ, q);
+ 	cipher.logp += logp;
+ }
+ 
+@@ -852,15 +885,194 @@ void Scheme::divByPo2AndEqual(Ciphertext& cipher, long bits) {
  	cipher.logq -= bits;
  }
  
++// more accurate ctxt multiplication: postpone rescaling
++// bits per level = logp
++void Scheme::matchScalingFactor(Ciphertext &dst1, Ciphertext &dst2, const Ciphertext &src1, const Ciphertext &src2, long logp) {
++    // TODO: optimize: avoid creating and copying ctxts
++    dst1.copy(src1);
++    dst2.copy(src2);
++    // compare the capacity of the ctxts
++    Ciphertext* less_cap = &dst1, *more_cap = &dst2;
++    long diff_cap = (dst1.logq - dst1.logp) - (dst2.logq - dst2.logp);
++    if(diff_cap > 0){
++        less_cap = &dst2;
++        more_cap = &dst1;
++    } // TODO: is it necessary to choose the ctxt with smaller rounding error when diff_cap == 0?
++    // rescale them s.t.
++    // (1) all of less_cap's capacity is preserved
++    // (2) more_cap's scaling factor is `logp`
++    // (3) less_cap and more_cap have the same logq
++    if(more_cap->logp > logp)
++        reScaleByAndEqual(*more_cap, more_cap->logp - logp);
++    if(less_cap->logq > more_cap->logq){
++        reScaleByAndEqual(*less_cap, less_cap->logq - more_cap->logq);
++    }
++    else if(less_cap->logq < more_cap->logq){
++        modDownToAndEqual(*more_cap, less_cap->logq);
++    }
++}
++
 +// ****************** raw mult *****************
 +// inplace-safe
 +// return (b1*b2, a1*b2 + a2*b1, a1*a2)
 +void Scheme::multRaw(Ciphertext& res, const Ciphertext &cipher1, const Ciphertext &cipher2){
 +    if(cipher1.cx || cipher2.cx)
 +        throw std::invalid_argument("cannot multiply with 3-tuple ctxt");
-+    res.copyParams(cipher1);
-+    res.logp += cipher2.logp;
-+    if(!res.cx)
-+        res.cx = new ZZ[N];
++    if(cipher1.n != cipher2.n)
++        throw std::invalid_argument("params mismatch");
++    if(cipher1.logq != cipher2.logq){
++        fprintf(stderr, "warning: logq different\n");
++    }
++    res.n = cipher1.n;
++    res.logq = std::min(cipher1.logq, cipher2.logq);
++    res.logp = cipher1.logp +  cipher2.logp; // NOTE: for inplace safety
++    res.addCX();
 +
-+    ZZ q = ring.qpows[cipher1.logq];
++    ZZ q = ring.qpows[res.logq];
 +
 +    long np = ceil((2 + cipher1.logq + cipher2.logq + logN + 2)/(double)pbnd);
 +
@@ -619,8 +702,7 @@ index 0b1fa9a..1e4f098 100644
 +        throw std::invalid_argument("cannot multiply with 3-tuple ctxt");
 +    res.copyParams(cipher);
 +    res.logp += cipher.logp;
-+    if(!res.cx)
-+        res.cx = new ZZ[N];
++    res.addCX();
 +
 +    ZZ q = ring.qpows[cipher.logq];
 +
@@ -648,6 +730,8 @@ index 0b1fa9a..1e4f098 100644
 +// inplace-safe
 +void Scheme::relinearize(Ciphertext &res, const Ciphertext &cipher){
 +    if(!cipher.cx){
++        if(&res != &cipher)
++            res.copy(cipher);
 +        return;
 +    }
 +    res.copyParams(cipher);
@@ -673,8 +757,7 @@ index 0b1fa9a..1e4f098 100644
 +
 +    delete[] as;
 +    delete[] bs;
-+    delete[] res.cx;
-+    res.cx = nullptr;
++    res.dropCX();
 +}
 +
 +void Scheme::relinearizeInplace(Ciphertext &cipher) {
@@ -693,9 +776,11 @@ index 0b1fa9a..1e4f098 100644
 +    ring.leftShift(res.ax, cipher.ax, dlogp, newq);
 +    ring.leftShift(res.bx, cipher.bx, dlogp, newq);
 +    if(cipher.cx){
-+        res.cx = new ZZ[N];
++        res.addCX();
 +        ring.leftShift(res.cx, cipher.cx, dlogp, newq);
 +    }
++    else
++        res.dropCX();
 +}
 +
 +void Scheme::equalize(Ciphertext &cipher1, Ciphertext &cipher2) {
@@ -713,7 +798,72 @@ index 0b1fa9a..1e4f098 100644
  void Scheme::reScaleBy(Ciphertext& res, Ciphertext& cipher, long dlogq) {
  	res.copyParams(cipher);
  	ring.rightShift(res.ax, cipher.ax, dlogq);
-@@ -914,6 +1074,8 @@ void Scheme::modDownToAndEqual(Ciphertext& cipher, long logq) {
+ 	ring.rightShift(res.bx, cipher.bx, dlogq);
+ 	res.logp -= dlogq;
+ 	res.logq -= dlogq;
++    if(cipher.cx){
++        res.addCX();
++        ring.rightShift(res.cx, cipher.cx, dlogq);
++    }
++    else
++        res.dropCX();
+ }
+ 
+ void Scheme::reScaleTo(Ciphertext& res, Ciphertext& cipher, long logq) {
+@@ -876,6 +1088,8 @@ void Scheme::reScaleByAndEqual(Ciphertext& cipher, long dlogq) {
+ 	ring.rightShiftAndEqual(cipher.bx, dlogq);
+ 	cipher.logq -= dlogq;
+ 	cipher.logp -= dlogq;
++    if(cipher.cx)
++        ring.rightShiftAndEqual(cipher.cx, dlogq);
+ }
+ 
+ void Scheme::reScaleToAndEqual(Ciphertext& cipher, long logq) {
+@@ -884,6 +1098,8 @@ void Scheme::reScaleToAndEqual(Ciphertext& cipher, long logq) {
+ 	ring.rightShiftAndEqual(cipher.bx, dlogq);
+ 	cipher.logq = logq;
+ 	cipher.logp -= dlogq;
++    if(cipher.cx)
++        ring.rightShiftAndEqual(cipher.cx, dlogq);
+ }
+ 
+ void Scheme::modDownBy(Ciphertext& res, Ciphertext& cipher, long dlogq) {
+@@ -892,6 +1108,12 @@ void Scheme::modDownBy(Ciphertext& res, Ciphertext& cipher, long dlogq) {
+ 	ring.mod(res.ax, cipher.ax, q);
+ 	ring.mod(res.bx, cipher.bx, q);
+ 	res.logq -= dlogq;
++    if(cipher.cx){
++        res.addCX();
++        ring.mod(res.cx, cipher.cx, q);
++    }
++    else
++        res.dropCX();
+ }
+ 
+ void Scheme::modDownByAndEqual(Ciphertext& cipher, long dlogq) {
+@@ -899,6 +1121,8 @@ void Scheme::modDownByAndEqual(Ciphertext& cipher, long dlogq) {
+ 	ring.modAndEqual(cipher.ax, q);
+ 	ring.modAndEqual(cipher.bx, q);
+ 	cipher.logq -= dlogq;
++    if(cipher.cx)
++        ring.modAndEqual(cipher.cx, q);
+ }
+ 
+ void Scheme::modDownTo(Ciphertext& res, Ciphertext& cipher, long logq) {
+@@ -907,6 +1131,12 @@ void Scheme::modDownTo(Ciphertext& res, Ciphertext& cipher, long logq) {
+ 	ring.mod(res.ax, cipher.ax, q);
+ 	ring.mod(res.bx, cipher.bx, q);
+ 	res.logq = logq;
++    if(cipher.cx){
++        res.addCX();
++        ring.mod(res.cx, cipher.cx, q);
++    }
++    else
++        res.dropCX();
+ }
+ 
+ void Scheme::modDownToAndEqual(Ciphertext& cipher, long logq) {
+@@ -914,6 +1144,8 @@ void Scheme::modDownToAndEqual(Ciphertext& cipher, long logq) {
  	cipher.logq = logq;
  	ring.modAndEqual(cipher.ax, q);
  	ring.modAndEqual(cipher.bx, q);
@@ -723,7 +873,7 @@ index 0b1fa9a..1e4f098 100644
  
  
 diff --git a/HEAAN/src/Scheme.h b/HEAAN/src/Scheme.h
-index 0c41b52..bfb1088 100644
+index 0c41b52..ba77592 100644
 --- a/HEAAN/src/Scheme.h
 +++ b/HEAAN/src/Scheme.h
 @@ -118,51 +118,53 @@ public:
@@ -806,11 +956,13 @@ index 0c41b52..bfb1088 100644
  
  	void multByConstAndEqual(Ciphertext& cipher, std::complex<double> cnst, long logp);
  
-@@ -196,11 +198,30 @@ public:
+@@ -196,11 +198,32 @@ public:
  
  	void divByPo2AndEqual(Ciphertext& cipher, long bits);
  
 +    // ******************* raw multiplications **********************
++
++    void matchScalingFactor(Ciphertext& dst1, Ciphertext& dst2, const Ciphertext& src1, const Ciphertext& src2, long logp);
 +
 +    void multRaw(Ciphertext& res, const Ciphertext &cipher1, const Ciphertext &cipher2);
 +
